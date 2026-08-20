@@ -1,4 +1,8 @@
+name: Stock Alert
+
 on:
+  workflow_dispatch:
+
   schedule:
     # 日本時間 10:00
     - cron: "0 1 * * 1-5"
@@ -15,4 +19,29 @@ on:
     # 日本時間 15:45
     - cron: "45 6 * * 1-5"
 
-  workflow_dispatch:
+jobs:
+  stock-alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance pandas supabase requests
+
+      - name: Check portfolio
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          python notify.py
