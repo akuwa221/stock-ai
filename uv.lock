@@ -1716,6 +1716,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "pandas" },
+    { name = "requests" },
     { name = "streamlit" },
     { name = "supabase" },
     { name = "yfinance" },
@@ -1724,6 +1725,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "pandas" },
+    { name = "requests" },
     { name = "streamlit", specifier = ">=1.61.1" },
     { name = "supabase" },
     { name = "yfinance" },

@@ -9,6 +9,7 @@ dependencies = [
     "yfinance",
     "pandas",
     "supabase",
+    "requests",
 ]
 
 [tool.uv]

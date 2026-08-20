@@ -1,0 +1,20 @@
+name: Test Notification
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-notification:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Send test notification
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          curl \
+            -H "Title: 株AI" \
+            -H "Priority: high" \
+            -H "Tags: chart_with_upwards_trend" \
+            -d "株AIの通知テストです。通知設定は正常です。" \
+            "https://ntfy.sh/$NTFY_TOPIC"
