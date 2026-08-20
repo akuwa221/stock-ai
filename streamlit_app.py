@@ -2447,398 +2447,436 @@ if holdings and total_cost_known > 0:
     if failed_count:
         st.caption(f"※ {failed_count}銘柄は最新取得に失敗しています。")
 
-    st.caption("⚠️ 危険度の高い銘柄から表示")
+    st.caption("下の選択欄から、確認したい銘柄を1つ選んで表示します。")
     st.divider()
 
 
 # =========================================================
-# 保有株表示
+# 保有株表示 / 銘柄切り替え
 # =========================================================
 
-st.subheader("📋 保有株")
+
+def render_add_holding_form():
+    st.subheader("➕ 保有株を追加")
+    new_ticker = st.text_input("銘柄コード", placeholder="例：7203", key="new_ticker")
+    new_buy = st.number_input("買値", min_value=0.0, step=1.0, key="new_buy")
+    new_shares = st.number_input("株数", min_value=1, value=100, step=1, key="new_shares")
+
+    if st.button("保存する", type="primary", key="save_new_holding"):
+        if not new_ticker.strip():
+            st.warning("銘柄コードを入力してください")
+        elif new_buy <= 0:
+            st.warning("買値を入力してください")
+        else:
+            supabase.table("portfolio").insert(
+                {
+                    "ticker": new_ticker.strip(),
+                    "buy_price": float(new_buy),
+                    "shares": int(new_shares),
+                    "stop_price": None,
+                    "initial_stop_price": None,
+                    "final_exit_price": None,
+                    "tp1_done": False,
+                    "tp2_done": False,
+                }
+            ).execute()
+            st.cache_data.clear()
+            st.rerun()
+
+
+st.subheader("📋 銘柄を選択")
 
 if not holdings:
-    st.info("まだ保有株がありません")
+    st.info("まだ保有株がありません。下から最初の銘柄を追加できます。")
+    render_add_holding_form()
+else:
+    selector_values = []
+    selector_labels = {}
+    item_by_selector = {}
 
-for item in items:
-    row = item["row"]
-    row_id = row["id"]
-    code = item["code"]
-    name = item["name"]
+    for item in items:
+        row_id = item["row"]["id"]
+        selector_key = f"holding:{row_id}"
+        selector_values.append(selector_key)
+        item_by_selector[selector_key] = item
 
-    st.markdown(f"## {code}")
-    if name and name != code:
-        st.markdown(f"### {name}")
-
-    if not item.get("fresh"):
-        if item.get("fallback"):
-            st.warning(
-                "⚠️ 最新株価を一時的に取得できませんでした。\n\n"
-                "前回の自動監視で取得した株価を表示しています。"
-            )
-            current_price = item["last_price"]
-            c1, c2 = st.columns(2)
-            with c1:
-                st.metric("前回取得値", f"{current_price:,.0f}円")
-            with c2:
-                st.metric("買値", f"{item['buy_price']:,.0f}円")
-            st.write(f"株数： **{item['shares']:,}株**")
-            st.write(f"参考評価額： **{item['value']:,.0f}円**")
-            if item["profit"] >= 0:
-                st.success(f"参考損益： +{item['profit']:,.0f}円 （+{item['profit_pct']:.2f}%）")
-            else:
-                st.error(f"参考損益： {item['profit']:,.0f}円 （{item['profit_pct']:.2f}%）")
-            if item.get("last_updated"):
-                st.caption(f"前回データ：{item['last_updated']}")
+        code = item["code"]
+        name = item.get("name") or code
+        if name and name != code:
+            selector_labels[selector_key] = f"{code}  {name}"
         else:
-            st.error("⚠️ 現在この銘柄の株価を取得できません。\n\n登録情報は消えていません。")
-            st.write(f"買値： **{item['buy_price']:,.0f}円**")
-            st.write(f"株数： **{item['shares']:,}株**")
+            selector_labels[selector_key] = code
 
-        with st.expander("⚠️ 取得エラー詳細"):
-            st.code(item["error"])
+    add_selector_key = "__add_holding__"
+    selector_values.append(add_selector_key)
+    selector_labels[add_selector_key] = "➕ 保有株を追加"
 
-        render_edit_controls(row, row_id, key_prefix="error_")
+    selected_selector = st.selectbox(
+        "表示する銘柄",
+        options=selector_values,
+        format_func=lambda value: selector_labels[value],
+        key="holding_selector",
+    )
+
+    if selected_selector == add_selector_key:
         st.divider()
-        continue
-
-    a = item["analysis"]
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.metric("現在値", f"{a['price']:,.0f}円", f"{a['change']:+,.0f}円")
-    with c2:
-        st.metric("買値", f"{item['buy_price']:,.0f}円")
-
-    st.write(f"株数： **{item['shares']:,}株**")
-    st.write(f"評価額： **{item['value']:,.0f}円**")
-
-    if item["profit"] >= 0:
-        st.success(f"含み損益： +{item['profit']:,.0f}円 （+{item['profit_pct']:.2f}%）")
+        render_add_holding_form()
     else:
-        st.error(f"含み損益： {item['profit']:,.0f}円 （{item['profit_pct']:.2f}%）")
+        selected_item = item_by_selector[selected_selector]
+        st.caption("選択した1銘柄だけを表示しています。別の銘柄は上の選択欄から切り替えられます。")
+        st.divider()
 
-    # -----------------------------------------------------
-    # 保有・売却判断
-    # -----------------------------------------------------
-    st.markdown("### 🧭 保有・売却判断")
-    judgment = item["judgment"]
-    if "🔴" in judgment or "損切り" in judgment:
-        st.error(judgment)
-    elif "🟠" in judgment or "警戒" in judgment:
-        st.warning(judgment)
-    else:
-        st.success(judgment)
-    st.caption(item["judgment_reason"])
+        # 既存の1銘柄表示ロジックをそのまま利用します。
+        for item in [selected_item]:
+            row = item["row"]
+            row_id = row["id"]
+            code = item["code"]
+            name = item["name"]
 
-    # -----------------------------------------------------
-    # 2段階防御ライン
-    # -----------------------------------------------------
-    st.markdown("### 🛡️ 2段階防御ライン")
+            st.markdown(f"## {code}")
+            if name and name != code:
+                st.markdown(f"### {name}")
 
-    active_stop = item["active_stop"]
-    gap_yen = item["stop_gap_yen"]
-    gap_pct = item["stop_gap_pct"]
+            if not item.get("fresh"):
+                if item.get("fallback"):
+                    st.warning(
+                        "⚠️ 最新株価を一時的に取得できませんでした。\n\n"
+                        "前回の自動監視で取得した株価を表示しています。"
+                    )
+                    current_price = item["last_price"]
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.metric("前回取得値", f"{current_price:,.0f}円")
+                    with c2:
+                        st.metric("買値", f"{item['buy_price']:,.0f}円")
+                    st.write(f"株数： **{item['shares']:,}株**")
+                    st.write(f"参考評価額： **{item['value']:,.0f}円**")
+                    if item["profit"] >= 0:
+                        st.success(f"参考損益： +{item['profit']:,.0f}円 （+{item['profit_pct']:.2f}%）")
+                    else:
+                        st.error(f"参考損益： {item['profit']:,.0f}円 （{item['profit_pct']:.2f}%）")
+                    if item.get("last_updated"):
+                        st.caption(f"前回データ：{item['last_updated']}")
+                else:
+                    st.error("⚠️ 現在この銘柄の株価を取得できません。\n\n登録情報は消えていません。")
+                    st.write(f"買値： **{item['buy_price']:,.0f}円**")
+                    st.write(f"株数： **{item['shares']:,}株**")
 
-    final_exit = item["final_exit"]
-    final_gap_yen = item["final_exit_gap_yen"]
-    final_gap_pct = item["final_exit_gap_pct"]
+                with st.expander("⚠️ 取得エラー詳細"):
+                    st.code(item["error"])
 
-    if item["final_exit_breached"]:
-        st.error(
-            "🚨 **最終撤退ライン到達・割れ**\n\n"
-            f"最終撤退ライン： **{final_exit:,.0f}円**\n\n"
-            f"現在値： **{a['price']:,.0f}円**"
-        )
-    elif item["warning_breached"]:
-        if item["warning_close_breached"]:
-            st.error(
-                "⚠️ **警戒ラインを確定終値でも割れています**\n\n"
-                f"警戒ライン： **{active_stop:,.0f}円**\n\n"
-                f"確定終値： **{a['confirmed_close']:,.0f}円**"
-            )
-        else:
-            st.warning(
-                "⚠️ **警戒ラインを場中に割れています**\n\n"
-                f"警戒ライン： **{active_stop:,.0f}円**\n\n"
-                "一瞬の割れだけでは即売却せず、終値と下落継続リスクを確認します。"
-            )
-    elif gap_pct <= 2:
-        st.warning(
-            "⚠️ **警戒ライン接近**\n\n"
-            f"警戒ライン： **{active_stop:,.0f}円**\n\n"
-            f"あと： **{gap_yen:,.0f}円 （{gap_pct:.2f}%）**"
-        )
-    else:
-        st.info(
-            f"⚠️ 警戒ライン： **{active_stop:,.0f}円**\n\n"
-            f"現在値まで： **{gap_yen:,.0f}円 （{gap_pct:.2f}%）**"
-        )
-
-    st.error(
-        f"🚨 最終撤退ライン： **{final_exit:,.0f}円**\n\n"
-        f"現在値まで： **{final_gap_yen:,.0f}円 （{final_gap_pct:.2f}%）**"
-    )
-
-    st.caption(
-        f"警戒ラインは現在の下落継続リスクに合わせて計算 "
-        f"（ATR × {a['stop_atr_multiplier']:.2f}）。"
-    )
-    st.caption(
-        "最終撤退ラインは、警戒ラインからさらに0.5ATR以上"
-        "（最低1.5%）下に置きます。"
-    )
-    st.caption(
-        "警戒ラインを一瞬割っただけでは即売却しません。"
-        "『確定終値でも警戒ライン割れ＋下落継続リスクが注意以上』で"
-        "一部撤退を検討し、最終撤退ライン到達では売却判断を強めます。"
-    )
-
-    st.markdown("#### 🚨 下落継続リスク")
-    if a["downside_risk"] >= 4:
-        st.error(f"{a['downside_label']}  （スコア {a['downside_risk']}）")
-    elif a["downside_risk"] >= 2:
-        st.warning(f"{a['downside_label']}  （スコア {a['downside_risk']}）")
-    else:
-        st.success(f"{a['downside_label']}  （スコア {a['downside_risk']}）")
-
-    if a["downside_reasons"]:
-        for reason in a["downside_reasons"]:
-            st.caption(f"・{reason}")
-    else:
-        st.caption("安値割れ・25日線下降・急落出来高などの下落継続条件は目立っていません。")
-
-    st.caption(
-        "テクニカルの『危険』は現在のトレンドの弱さを表します。"
-        "売却判断は、警戒ライン・最終撤退ライン・下落継続リスクを組み合わせます。"
-    )
-    st.caption("一度引き上げた2本の防御ラインは、判定が改善しても自動では下がりません。")
-
-    # -----------------------------------------------------
-    # 利確
-    # -----------------------------------------------------
-    st.markdown("### 🎯 利確ライン")
-    tp1 = item["tp1"]
-    tp2 = item["tp2"]
-
-    if a["price"] >= tp2:
-        st.success(f"🎯 利確②到達： **{tp2:,.0f}円**")
-    elif a["price"] >= tp1:
-        st.success(f"🎯 利確①到達： **{tp1:,.0f}円**")
-    else:
-        st.write(
-            f"利確①： **{tp1:,.0f}円** "
-            f"（あと {max(item['tp1_gap'], 0):,.0f}円 / {max(item['tp1_gap_pct'], 0):.2f}%）"
-        )
-        st.write(
-            f"利確②： **{tp2:,.0f}円** "
-            f"（あと {max(item['tp2_gap'], 0):,.0f}円 / {max(item['tp2_gap_pct'], 0):.2f}%）"
-        )
-
-    st.write(f"📈 20日高値目安： **{a['prior_20_high']:,.0f}円**")
-    st.caption("利確①＝初期リスクの1.5倍、利確②＝初期リスクの2倍。")
-
-    # -----------------------------------------------------
-    # 上値ルート
-    # -----------------------------------------------------
-    st.markdown("### 📈 上値ルート")
-    route = item["route"]
-    active_info = route["active_info"]
-    active_level = route["active_level"]
-    confirmed_level = route["recent_confirmed_level"]
-
-    if confirmed_level is not None:
-        st.success(
-            f"✅ **{confirmed_level:,.0f}円を正式突破確認**\n\n"
-            "下側から上抜けたうえで、一定時間の維持＋出来高、"
-            "または終値＋出来高の条件を満たしています。"
-        )
-
-    if active_info["state"] == "testing_above":
-        st.warning(
-            f"⚠️ **{active_level:,.0f}円より上ですが、まだ正式突破ではありません**\n\n"
-            "下側からの上抜け確認と、15分維持＋出来高を確認中です。"
-        )
-    elif active_info["state"] == "strong_resistance":
-        st.error(
-            f"🧱 **{active_level:,.0f}円は強い抵抗線**\n\n"
-            f"過去5営業日で **{active_info['rejection_count']}回** 跳ね返されています。\n\n"
-            "テクニカル判定にもマイナス材料として反映しています。"
-        )
-    elif active_info["state"] == "resistance":
-        st.warning(
-            f"⚠️ **{active_level:,.0f}円で{active_info['rejection_count']}回跳ね返されています**\n\n"
-            "上値抵抗として意識され始めています。"
-        )
-    elif active_info["state"] == "approaching":
-        st.info(f"👀 **{active_level:,.0f}円に接近中**\n\nここを突破できるかを見る局面です。")
-
-    zones = route["zones"]
-    if zones:
-        for index, zone in enumerate(zones[:5]):
-            low = zone["low"]
-            high = zone["high"]
-            labels = "・".join(zone["labels"])
-            price_text = f"{low:,.0f}円" if abs(high - low) < 1 else f"{low:,.0f}〜{high:,.0f}円"
-
-            if index == 0 and low <= a["price"]:
-                st.warning(f"① 突破確認中： **{price_text}** （{labels}）")
+                render_edit_controls(row, row_id, key_prefix="error_")
+                st.divider()
                 continue
 
-            distance = low - a["price"]
-            distance_pct = distance / a["price"] * 100
+            a = item["analysis"]
 
-            if index == 0:
-                st.info(
-                    "① 次に超えたいライン\n\n"
-                    f"**{price_text}**\n\n"
-                    f"{labels}\n\n"
-                    f"あと **{distance:,.0f}円 （{distance_pct:.2f}%）**"
-                )
-            elif index == 1:
-                st.write(f"② 突破後の目標： **{price_text}** （{labels}）")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric("現在値", f"{a['price']:,.0f}円", f"{a['change']:+,.0f}円")
+            with c2:
+                st.metric("買値", f"{item['buy_price']:,.0f}円")
+
+            st.write(f"株数： **{item['shares']:,}株**")
+            st.write(f"評価額： **{item['value']:,.0f}円**")
+
+            if item["profit"] >= 0:
+                st.success(f"含み損益： +{item['profit']:,.0f}円 （+{item['profit_pct']:.2f}%）")
             else:
-                st.write(f"{index + 1}️⃣ **{price_text}** （{labels}）")
+                st.error(f"含み損益： {item['profit']:,.0f}円 （{item['profit_pct']:.2f}%）")
 
-    st.markdown("#### 🧭 今の見方")
-    if active_info["state"] == "strong_resistance":
-        st.warning(
-            f"{active_level:,.0f}円で何度も跳ね返されているため、"
-            "遠い利確ラインよりこの抵抗線を突破できるかを優先して見ます。"
-        )
-    elif active_info["state"] == "testing_above":
-        st.warning(
-            f"{active_level:,.0f}円より上ですが、下側からの正式な突破確認がまだありません。"
-            "ダマシ扱いを避けるため、次の目標へ進んだ扱いにはしていません。"
-        )
-    elif confirmed_level is not None:
-        st.success(f"{confirmed_level:,.0f}円の正式突破を確認。次の上値目標へ進む局面です。")
-    elif active_info["state"] == "approaching":
-        st.info(f"まず{active_level:,.0f}円を明確に突破できるかを確認します。")
-    elif a["level"] in ["strong", "up"]:
-        st.success(f"上昇トレンド中。まず{active_level:,.0f}円を目標にし、突破できれば次へ進みます。")
-    else:
-        st.warning(f"まず{active_level:,.0f}円まで戻せるかを確認。トレンドが弱い間は逆指値管理を優先します。")
+            # -----------------------------------------------------
+            # 保有・売却判断
+            # -----------------------------------------------------
+            st.markdown("### 🧭 保有・売却判断")
+            judgment = item["judgment"]
+            if "🔴" in judgment or "損切り" in judgment:
+                st.error(judgment)
+            elif "🟠" in judgment or "警戒" in judgment:
+                st.warning(judgment)
+            else:
+                st.success(judgment)
+            st.caption(item["judgment_reason"])
 
-    # -----------------------------------------------------
-    # テクニカル
-    # -----------------------------------------------------
-    st.markdown("### 📊 テクニカル判定")
-    if a["level"] in ["strong", "up"]:
-        st.success(a["status"])
-    elif a["level"] in ["neutral", "warning"]:
-        st.warning(a["status"])
-    else:
-        st.error(a["status"])
+            # -----------------------------------------------------
+            # 2段階防御ライン
+            # -----------------------------------------------------
+            st.markdown("### 🛡️ 2段階防御ライン")
 
-    # -----------------------------------------------------
-    # 3年バックテスト
-    # -----------------------------------------------------
-    render_backtest(
-        code=code,
-        row_id=row_id,
-        current_status=a["status"],
-        current_downside_risk=a["downside_risk"],
-        current_candidate_risk=a["candidate_downside_risk"],
-    )
+            active_stop = item["active_stop"]
+            gap_yen = item["stop_gap_yen"]
+            gap_pct = item["stop_gap_pct"]
 
-    # -----------------------------------------------------
-    # ニュース
-    # -----------------------------------------------------
-    with st.expander("📰 関連ニュース"):
-        news = get_japanese_news(name, code)
-        if not news:
-            st.info("関連する日本語ニュースを取得できませんでした。")
-        for i, n in enumerate(news, start=1):
-            st.markdown(f"### {i}. {n['title']}")
-            caption_parts = []
-            if n["source"]:
-                caption_parts.append(n["source"])
-            if n["date"]:
-                caption_parts.append(n["date"])
-            if caption_parts:
-                st.caption(" / ".join(caption_parts))
-            st.link_button("記事を開く", n["url"])
+            final_exit = item["final_exit"]
+            final_gap_yen = item["final_exit_gap_yen"]
+            final_gap_pct = item["final_exit_gap_pct"]
+
+            if item["final_exit_breached"]:
+                st.error(
+                    "🚨 **最終撤退ライン到達・割れ**\n\n"
+                    f"最終撤退ライン： **{final_exit:,.0f}円**\n\n"
+                    f"現在値： **{a['price']:,.0f}円**"
+                )
+            elif item["warning_breached"]:
+                if item["warning_close_breached"]:
+                    st.error(
+                        "⚠️ **警戒ラインを確定終値でも割れています**\n\n"
+                        f"警戒ライン： **{active_stop:,.0f}円**\n\n"
+                        f"確定終値： **{a['confirmed_close']:,.0f}円**"
+                    )
+                else:
+                    st.warning(
+                        "⚠️ **警戒ラインを場中に割れています**\n\n"
+                        f"警戒ライン： **{active_stop:,.0f}円**\n\n"
+                        "一瞬の割れだけでは即売却せず、終値と下落継続リスクを確認します。"
+                    )
+            elif gap_pct <= 2:
+                st.warning(
+                    "⚠️ **警戒ライン接近**\n\n"
+                    f"警戒ライン： **{active_stop:,.0f}円**\n\n"
+                    f"あと： **{gap_yen:,.0f}円 （{gap_pct:.2f}%）**"
+                )
+            else:
+                st.info(
+                    f"⚠️ 警戒ライン： **{active_stop:,.0f}円**\n\n"
+                    f"現在値まで： **{gap_yen:,.0f}円 （{gap_pct:.2f}%）**"
+                )
+
+            st.error(
+                f"🚨 最終撤退ライン： **{final_exit:,.0f}円**\n\n"
+                f"現在値まで： **{final_gap_yen:,.0f}円 （{final_gap_pct:.2f}%）**"
+            )
+
+            st.caption(
+                f"警戒ラインは現在の下落継続リスクに合わせて計算 "
+                f"（ATR × {a['stop_atr_multiplier']:.2f}）。"
+            )
+            st.caption(
+                "最終撤退ラインは、警戒ラインからさらに0.5ATR以上"
+                "（最低1.5%）下に置きます。"
+            )
+            st.caption(
+                "警戒ラインを一瞬割っただけでは即売却しません。"
+                "『確定終値でも警戒ライン割れ＋下落継続リスクが注意以上』で"
+                "一部撤退を検討し、最終撤退ライン到達では売却判断を強めます。"
+            )
+
+            st.markdown("#### 🚨 下落継続リスク")
+            if a["downside_risk"] >= 4:
+                st.error(f"{a['downside_label']}  （スコア {a['downside_risk']}）")
+            elif a["downside_risk"] >= 2:
+                st.warning(f"{a['downside_label']}  （スコア {a['downside_risk']}）")
+            else:
+                st.success(f"{a['downside_label']}  （スコア {a['downside_risk']}）")
+
+            if a["downside_reasons"]:
+                for reason in a["downside_reasons"]:
+                    st.caption(f"・{reason}")
+            else:
+                st.caption("安値割れ・25日線下降・急落出来高などの下落継続条件は目立っていません。")
+
+            st.caption(
+                "テクニカルの『危険』は現在のトレンドの弱さを表します。"
+                "売却判断は、警戒ライン・最終撤退ライン・下落継続リスクを組み合わせます。"
+            )
+            st.caption("一度引き上げた2本の防御ラインは、判定が改善しても自動では下がりません。")
+
+            # -----------------------------------------------------
+            # 利確
+            # -----------------------------------------------------
+            st.markdown("### 🎯 利確ライン")
+            tp1 = item["tp1"]
+            tp2 = item["tp2"]
+
+            if a["price"] >= tp2:
+                st.success(f"🎯 利確②到達： **{tp2:,.0f}円**")
+            elif a["price"] >= tp1:
+                st.success(f"🎯 利確①到達： **{tp1:,.0f}円**")
+            else:
+                st.write(
+                    f"利確①： **{tp1:,.0f}円** "
+                    f"（あと {max(item['tp1_gap'], 0):,.0f}円 / {max(item['tp1_gap_pct'], 0):.2f}%）"
+                )
+                st.write(
+                    f"利確②： **{tp2:,.0f}円** "
+                    f"（あと {max(item['tp2_gap'], 0):,.0f}円 / {max(item['tp2_gap_pct'], 0):.2f}%）"
+                )
+
+            st.write(f"📈 20日高値目安： **{a['prior_20_high']:,.0f}円**")
+            st.caption("利確①＝初期リスクの1.5倍、利確②＝初期リスクの2倍。")
+
+            # -----------------------------------------------------
+            # 上値ルート
+            # -----------------------------------------------------
+            st.markdown("### 📈 上値ルート")
+            route = item["route"]
+            active_info = route["active_info"]
+            active_level = route["active_level"]
+            confirmed_level = route["recent_confirmed_level"]
+
+            if confirmed_level is not None:
+                st.success(
+                    f"✅ **{confirmed_level:,.0f}円を正式突破確認**\n\n"
+                    "下側から上抜けたうえで、一定時間の維持＋出来高、"
+                    "または終値＋出来高の条件を満たしています。"
+                )
+
+            if active_info["state"] == "testing_above":
+                st.warning(
+                    f"⚠️ **{active_level:,.0f}円より上ですが、まだ正式突破ではありません**\n\n"
+                    "下側からの上抜け確認と、15分維持＋出来高を確認中です。"
+                )
+            elif active_info["state"] == "strong_resistance":
+                st.error(
+                    f"🧱 **{active_level:,.0f}円は強い抵抗線**\n\n"
+                    f"過去5営業日で **{active_info['rejection_count']}回** 跳ね返されています。\n\n"
+                    "テクニカル判定にもマイナス材料として反映しています。"
+                )
+            elif active_info["state"] == "resistance":
+                st.warning(
+                    f"⚠️ **{active_level:,.0f}円で{active_info['rejection_count']}回跳ね返されています**\n\n"
+                    "上値抵抗として意識され始めています。"
+                )
+            elif active_info["state"] == "approaching":
+                st.info(f"👀 **{active_level:,.0f}円に接近中**\n\nここを突破できるかを見る局面です。")
+
+            zones = route["zones"]
+            if zones:
+                for index, zone in enumerate(zones[:5]):
+                    low = zone["low"]
+                    high = zone["high"]
+                    labels = "・".join(zone["labels"])
+                    price_text = f"{low:,.0f}円" if abs(high - low) < 1 else f"{low:,.0f}〜{high:,.0f}円"
+
+                    if index == 0 and low <= a["price"]:
+                        st.warning(f"① 突破確認中： **{price_text}** （{labels}）")
+                        continue
+
+                    distance = low - a["price"]
+                    distance_pct = distance / a["price"] * 100
+
+                    if index == 0:
+                        st.info(
+                            "① 次に超えたいライン\n\n"
+                            f"**{price_text}**\n\n"
+                            f"{labels}\n\n"
+                            f"あと **{distance:,.0f}円 （{distance_pct:.2f}%）**"
+                        )
+                    elif index == 1:
+                        st.write(f"② 突破後の目標： **{price_text}** （{labels}）")
+                    else:
+                        st.write(f"{index + 1}️⃣ **{price_text}** （{labels}）")
+
+            st.markdown("#### 🧭 今の見方")
+            if active_info["state"] == "strong_resistance":
+                st.warning(
+                    f"{active_level:,.0f}円で何度も跳ね返されているため、"
+                    "遠い利確ラインよりこの抵抗線を突破できるかを優先して見ます。"
+                )
+            elif active_info["state"] == "testing_above":
+                st.warning(
+                    f"{active_level:,.0f}円より上ですが、下側からの正式な突破確認がまだありません。"
+                    "ダマシ扱いを避けるため、次の目標へ進んだ扱いにはしていません。"
+                )
+            elif confirmed_level is not None:
+                st.success(f"{confirmed_level:,.0f}円の正式突破を確認。次の上値目標へ進む局面です。")
+            elif active_info["state"] == "approaching":
+                st.info(f"まず{active_level:,.0f}円を明確に突破できるかを確認します。")
+            elif a["level"] in ["strong", "up"]:
+                st.success(f"上昇トレンド中。まず{active_level:,.0f}円を目標にし、突破できれば次へ進みます。")
+            else:
+                st.warning(f"まず{active_level:,.0f}円まで戻せるかを確認。トレンドが弱い間は逆指値管理を優先します。")
+
+            # -----------------------------------------------------
+            # テクニカル
+            # -----------------------------------------------------
+            st.markdown("### 📊 テクニカル判定")
+            if a["level"] in ["strong", "up"]:
+                st.success(a["status"])
+            elif a["level"] in ["neutral", "warning"]:
+                st.warning(a["status"])
+            else:
+                st.error(a["status"])
+
+            # -----------------------------------------------------
+            # 3年バックテスト
+            # -----------------------------------------------------
+            render_backtest(
+                code=code,
+                row_id=row_id,
+                current_status=a["status"],
+                current_downside_risk=a["downside_risk"],
+                current_candidate_risk=a["candidate_downside_risk"],
+            )
+
+            # -----------------------------------------------------
+            # ニュース
+            # -----------------------------------------------------
+            with st.expander("📰 関連ニュース"):
+                news = get_japanese_news(name, code)
+                if not news:
+                    st.info("関連する日本語ニュースを取得できませんでした。")
+                for i, n in enumerate(news, start=1):
+                    st.markdown(f"### {i}. {n['title']}")
+                    caption_parts = []
+                    if n["source"]:
+                        caption_parts.append(n["source"])
+                    if n["date"]:
+                        caption_parts.append(n["date"])
+                    if caption_parts:
+                        st.caption(" / ".join(caption_parts))
+                    st.link_button("記事を開く", n["url"])
+                    st.divider()
+
+            # -----------------------------------------------------
+            # 詳細
+            # -----------------------------------------------------
+            with st.expander("📊 詳細分析"):
+                st.write(f"最新営業日： **{a['latest_date']}**")
+                st.write(f"価格データ： **{a['price_source']}**")
+                if a["latest_time"] is not None:
+                    st.write(f"最終データ時刻： **{a['latest_time'].strftime('%H:%M')}**")
+                if a["synthetic"]:
+                    st.warning("日足更新が遅れているため、1分足などから最新日を補完しています。")
+
+                st.write(f"前日比： **{a['change_pct']:+.2f}%**")
+                st.write(f"5日線： **{a['ma5']:,.0f}円**")
+                st.write(f"25日線： **{a['ma25']:,.0f}円**")
+                st.write(f"75日線： **{a['ma75']:,.0f}円**")
+                st.write(f"20日高値： **{a['recent_high']:,.0f}円**")
+                st.write(f"20日安値： **{a['recent_low']:,.0f}円**")
+                st.write(f"出来高20日平均比： **{a['volume_ratio']:.2f}倍**")
+                st.write(f"ATR： **{a['atr14']:,.0f}円**")
+                st.write(f"判定スコア： **{a['score']}**")
+
+                st.markdown("#### 🛡️ 2段階防御ライン詳細")
+                st.write(f"初期警戒ライン： **{item['initial_stop']:,.0f}円**")
+                st.write(f"現在の警戒ライン： **{active_stop:,.0f}円**")
+                st.write(f"最終撤退ライン： **{item['final_exit']:,.0f}円**")
+                st.write(f"通常の広め候補： **{a['base_stop_candidate']:,.0f}円**")
+                st.write(f"現在判定を反映した警戒候補： **{a['stop_candidate']:,.0f}円**")
+                st.write(f"現在ATR倍率： **{a['stop_atr_multiplier']:.2f}倍**")
+                st.write(f"下落継続リスク： **{a['downside_label']} / {a['downside_risk']}点**")
+                st.write(f"25日線5日傾き： **{a['ma25_slope_pct']:+.2f}%**")
+                st.write(f"20日安値明確割れ： **{'はい' if a['breakdown_confirmed'] else 'いいえ'}**")
+                st.write(f"初期リスク： **{item['risk_per_share']:,.0f}円/株**")
+
+                if a["stop_candidate"] < active_stop:
+                    st.success("今回の計算候補は保存済み警戒ラインより低いため、警戒ラインを下げず維持しています。")
+
+                st.markdown("#### 📈 チャート")
+                chart = a["daily"].tail(130)[["Close", "MA5", "MA25", "MA75"]].copy()
+                chart.columns = ["株価", "5日線", "25日線", "75日線"]
+                st.line_chart(chart)
+
+                st.markdown("#### 🔍 判定理由")
+                for reason in a["reasons"]:
+                    st.write(reason)
+
+            render_edit_controls(row, row_id)
             st.divider()
 
-    # -----------------------------------------------------
-    # 詳細
-    # -----------------------------------------------------
-    with st.expander("📊 詳細分析"):
-        st.write(f"最新営業日： **{a['latest_date']}**")
-        st.write(f"価格データ： **{a['price_source']}**")
-        if a["latest_time"] is not None:
-            st.write(f"最終データ時刻： **{a['latest_time'].strftime('%H:%M')}**")
-        if a["synthetic"]:
-            st.warning("日足更新が遅れているため、1分足などから最新日を補完しています。")
 
-        st.write(f"前日比： **{a['change_pct']:+.2f}%**")
-        st.write(f"5日線： **{a['ma5']:,.0f}円**")
-        st.write(f"25日線： **{a['ma25']:,.0f}円**")
-        st.write(f"75日線： **{a['ma75']:,.0f}円**")
-        st.write(f"20日高値： **{a['recent_high']:,.0f}円**")
-        st.write(f"20日安値： **{a['recent_low']:,.0f}円**")
-        st.write(f"出来高20日平均比： **{a['volume_ratio']:.2f}倍**")
-        st.write(f"ATR： **{a['atr14']:,.0f}円**")
-        st.write(f"判定スコア： **{a['score']}**")
-
-        st.markdown("#### 🛡️ 2段階防御ライン詳細")
-        st.write(f"初期警戒ライン： **{item['initial_stop']:,.0f}円**")
-        st.write(f"現在の警戒ライン： **{active_stop:,.0f}円**")
-        st.write(f"最終撤退ライン： **{item['final_exit']:,.0f}円**")
-        st.write(f"通常の広め候補： **{a['base_stop_candidate']:,.0f}円**")
-        st.write(f"現在判定を反映した警戒候補： **{a['stop_candidate']:,.0f}円**")
-        st.write(f"現在ATR倍率： **{a['stop_atr_multiplier']:.2f}倍**")
-        st.write(f"下落継続リスク： **{a['downside_label']} / {a['downside_risk']}点**")
-        st.write(f"25日線5日傾き： **{a['ma25_slope_pct']:+.2f}%**")
-        st.write(f"20日安値明確割れ： **{'はい' if a['breakdown_confirmed'] else 'いいえ'}**")
-        st.write(f"初期リスク： **{item['risk_per_share']:,.0f}円/株**")
-
-        if a["stop_candidate"] < active_stop:
-            st.success("今回の計算候補は保存済み警戒ラインより低いため、警戒ラインを下げず維持しています。")
-
-        st.markdown("#### 📈 チャート")
-        chart = a["daily"].tail(130)[["Close", "MA5", "MA25", "MA75"]].copy()
-        chart.columns = ["株価", "5日線", "25日線", "75日線"]
-        st.line_chart(chart)
-
-        st.markdown("#### 🔍 判定理由")
-        for reason in a["reasons"]:
-            st.write(reason)
-
-    render_edit_controls(row, row_id)
-    st.divider()
-
-
-# =========================================================
-# 新規追加
-# =========================================================
-
-st.subheader("➕ 保有株を追加")
-new_ticker = st.text_input("銘柄コード", placeholder="例：7203", key="new_ticker")
-new_buy = st.number_input("買値", min_value=0.0, step=1.0, key="new_buy")
-new_shares = st.number_input("株数", min_value=1, value=100, step=1, key="new_shares")
-
-if st.button("保存する", type="primary"):
-    if not new_ticker.strip():
-        st.warning("銘柄コードを入力してください")
-    elif new_buy <= 0:
-        st.warning("買値を入力してください")
-    else:
-        supabase.table("portfolio").insert(
-            {
-                "ticker": new_ticker.strip(),
-                "buy_price": float(new_buy),
-                "shares": int(new_shares),
-                "stop_price": None,
-                "initial_stop_price": None,
-                "final_exit_price": None,
-                "tp1_done": False,
-                "tp2_done": False,
-            }
-        ).execute()
-        st.cache_data.clear()
-        st.rerun()
 
 
 # =========================================================
