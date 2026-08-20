@@ -4,6 +4,7 @@ import pandas as pd
 import requests
 import xml.etree.ElementTree as ET
 import time as time_module
+import math
 
 from io import BytesIO
 from urllib.parse import quote_plus
@@ -41,7 +42,7 @@ CHECK_TIMES = [
 
 
 # =========================================================
-# 次回チェック
+# 次回自動チェック
 # =========================================================
 
 def get_next_check():
@@ -100,8 +101,8 @@ if next_check is not None:
 
     else:
 
-        next_text = (
-            next_check.strftime("%m/%d %H:%M")
+        next_text = next_check.strftime(
+            "%m/%d %H:%M"
         )
 
     st.write(
@@ -181,7 +182,7 @@ def to_jst_naive(index):
 
 
 # =========================================================
-# Yahoo取得リトライ
+# Yahoo株価取得リトライ
 # =========================================================
 
 def retry_history(
@@ -252,7 +253,9 @@ def retry_fast_price(
             )
 
             price = float(
-                stock.fast_info["last_price"]
+                stock.fast_info[
+                    "last_price"
+                ]
             )
 
             if price > 0:
@@ -271,6 +274,10 @@ def retry_fast_price(
 
     return None
 
+
+# =========================================================
+# 日足の予備取得
+# =========================================================
 
 def download_daily_fallback(
     ticker_code
@@ -321,7 +328,7 @@ def download_daily_fallback(
 
 
 # =========================================================
-# JPX銘柄名
+# JPX公式銘柄名
 # =========================================================
 
 @st.cache_data(
@@ -336,14 +343,17 @@ def get_jpx_name_map():
             JPX_URL,
             timeout=30,
             headers={
-                "User-Agent": "Mozilla/5.0"
+                "User-Agent":
+                    "Mozilla/5.0"
             }
         )
 
         response.raise_for_status()
 
         df = pd.read_excel(
-            BytesIO(response.content),
+            BytesIO(
+                response.content
+            ),
             engine="xlrd"
         )
 
@@ -389,6 +399,7 @@ def get_jpx_name_map():
 
         return result
 
+
     except Exception:
 
         return {}
@@ -404,13 +415,19 @@ def get_company_name(code):
         normalize_ticker(code)
     )
 
-    jpx_names = get_jpx_name_map()
+    jpx_names = (
+        get_jpx_name_map()
+    )
 
 
     if code in jpx_names:
-        return jpx_names[code]
+
+        return jpx_names[
+            code
+        ]
 
 
+    # JPX取得失敗時の予備
     try:
 
         stock = yf.Ticker(
@@ -430,7 +447,9 @@ def get_company_name(code):
             and str(name).strip() != code
         ):
 
-            return str(name).strip()
+            return str(
+                name
+            ).strip()
 
 
     except Exception:
@@ -441,7 +460,7 @@ def get_company_name(code):
 
 
 # =========================================================
-# 日本語ニュース
+# 日本語関連ニュース
 # =========================================================
 
 @st.cache_data(
@@ -473,7 +492,8 @@ def get_japanese_news(
             url,
             timeout=20,
             headers={
-                "User-Agent": "Mozilla/5.0"
+                "User-Agent":
+                    "Mozilla/5.0"
             }
         )
 
@@ -550,10 +570,17 @@ def get_japanese_news(
 
                 news.append(
                     {
-                        "title": title,
-                        "source": source,
-                        "date": pub_date,
-                        "url": link
+                        "title":
+                            title,
+
+                        "source":
+                            source,
+
+                        "date":
+                            pub_date,
+
+                        "url":
+                            link
                     }
                 )
 
@@ -563,6 +590,7 @@ def get_japanese_news(
 
 
         return news
+
 
     except Exception:
 
@@ -578,6 +606,7 @@ def make_intraday_daily(
 ):
 
     if intraday.empty:
+
         return pd.DataFrame()
 
 
@@ -599,11 +628,20 @@ def make_intraday_daily(
         "TradeDate"
     ).agg(
         {
-            "Open": "first",
-            "High": "max",
-            "Low": "min",
-            "Close": "last",
-            "Volume": "sum"
+            "Open":
+                "first",
+
+            "High":
+                "max",
+
+            "Low":
+                "min",
+
+            "Close":
+                "last",
+
+            "Volume":
+                "sum"
         }
     )
 
@@ -629,7 +667,9 @@ def make_intraday_daily(
 def analyze_stock(code):
 
     ticker_code = (
-        normalize_ticker(code)
+        normalize_ticker(
+            code
+        )
     )
 
 
@@ -645,6 +685,7 @@ def analyze_stock(code):
             interval="1d",
             attempts=3
         )
+
 
     except Exception:
 
@@ -715,7 +756,10 @@ def analyze_stock(code):
 
     if not intraday.empty:
 
-        intraday = intraday.copy()
+        intraday = (
+            intraday.copy()
+        )
+
 
         intraday.index = (
             to_jst_naive(
@@ -733,6 +777,10 @@ def analyze_stock(code):
             ]
         )
 
+
+    # -----------------------------------------------------
+    # Yahoo最新価格
+    # -----------------------------------------------------
 
     fast_price = (
         retry_fast_price(
@@ -757,16 +805,19 @@ def analyze_stock(code):
             .date()
         )
 
+
     else:
 
         intraday_last_date = None
 
 
     # -----------------------------------------------------
-    # 市場時間
+    # 日本時間・市場時間
     # -----------------------------------------------------
 
-    now = datetime.now(JST)
+    now = datetime.now(
+        JST
+    )
 
     today = now.date()
 
@@ -791,7 +842,7 @@ def analyze_stock(code):
 
 
     # -----------------------------------------------------
-    # 日足補完
+    # Yahoo日足遅延補完
     # -----------------------------------------------------
 
     synthetic = False
@@ -839,7 +890,9 @@ def analyze_stock(code):
         else:
 
             close_value = float(
-                d["Close"]
+                d[
+                    "Close"
+                ]
             )
 
 
@@ -847,14 +900,18 @@ def analyze_stock(code):
             {
                 "Open": [
                     float(
-                        d["Open"]
+                        d[
+                            "Open"
+                        ]
                     )
                 ],
 
                 "High": [
                     max(
                         float(
-                            d["High"]
+                            d[
+                                "High"
+                            ]
                         ),
                         close_value
                     )
@@ -863,7 +920,9 @@ def analyze_stock(code):
                 "Low": [
                     min(
                         float(
-                            d["Low"]
+                            d[
+                                "Low"
+                            ]
                         ),
                         close_value
                     )
@@ -961,9 +1020,11 @@ def analyze_stock(code):
             ].iloc[-1]
         )
 
+
         latest_time = (
             intraday.index[-1]
         )
+
 
         price_source = (
             "1分足（場中）"
@@ -981,6 +1042,7 @@ def analyze_stock(code):
             ].iloc[-1]
         )
 
+
         price_source = (
             "日足（終値）"
         )
@@ -988,7 +1050,8 @@ def analyze_stock(code):
 
     elif (
         fast_price is not None
-        and fast_price > 0
+        and
+        fast_price > 0
     ):
 
         latest_price = float(
@@ -1015,7 +1078,10 @@ def analyze_stock(code):
             ].iloc[-1]
         )
 
-        price_source = "日足"
+
+        price_source = (
+            "日足"
+        )
 
 
     # -----------------------------------------------------
@@ -1047,46 +1113,55 @@ def analyze_stock(code):
     # -----------------------------------------------------
 
     daily["MA5"] = (
-        daily["Close"]
+        daily[
+            "Close"
+        ]
         .rolling(5)
         .mean()
     )
 
 
     daily["MA25"] = (
-        daily["Close"]
+        daily[
+            "Close"
+        ]
         .rolling(25)
         .mean()
     )
 
 
     daily["MA75"] = (
-        daily["Close"]
+        daily[
+            "Close"
+        ]
         .rolling(75)
         .mean()
     )
 
 
     ma5 = float(
-        daily["MA5"]
-        .iloc[-1]
+        daily[
+            "MA5"
+        ].iloc[-1]
     )
 
 
     ma25 = float(
-        daily["MA25"]
-        .iloc[-1]
+        daily[
+            "MA25"
+        ].iloc[-1]
     )
 
 
     ma75 = float(
-        daily["MA75"]
-        .iloc[-1]
+        daily[
+            "MA75"
+        ].iloc[-1]
     )
 
 
     # -----------------------------------------------------
-    # 高値安値
+    # 高値・安値
     # -----------------------------------------------------
 
     recent_high = float(
@@ -1107,6 +1182,7 @@ def analyze_stock(code):
     )
 
 
+    # 今日を除いた過去20日高値
     prior_20_high = float(
         daily[
             "High"
@@ -1117,6 +1193,7 @@ def analyze_stock(code):
     )
 
 
+    # 今日を除いた過去20日安値
     prior_20_low = float(
         daily[
             "Low"
@@ -1239,7 +1316,7 @@ def analyze_stock(code):
 
 
     # -----------------------------------------------------
-    # 判定
+    # テクニカル判定
     # -----------------------------------------------------
 
     score = 0
@@ -1254,6 +1331,7 @@ def analyze_stock(code):
         reasons.append(
             "○ 株価が5日線より上"
         )
+
 
     else:
 
@@ -1272,6 +1350,7 @@ def analyze_stock(code):
             "○ 5日線が25日線より上"
         )
 
+
     else:
 
         score -= 1
@@ -1289,6 +1368,7 @@ def analyze_stock(code):
             "○ 株価が25日線より上"
         )
 
+
     else:
 
         score -= 1
@@ -1305,6 +1385,7 @@ def analyze_stock(code):
         reasons.append(
             "○ 25日線が75日線より上"
         )
+
 
     else:
 
@@ -1339,106 +1420,156 @@ def analyze_stock(code):
         )
 
 
+    # -----------------------------------------------------
+    # 判定ランク
+    # -----------------------------------------------------
+
     if score >= 4:
 
-        status = "🟢 強い上昇"
+        status = (
+            "🟢 強い上昇"
+        )
 
-        level = "strong"
+        level = (
+            "strong"
+        )
 
         risk_rank = 4
 
 
     elif score >= 2:
 
-        status = "🟢 上昇"
+        status = (
+            "🟢 上昇"
+        )
 
-        level = "up"
+        level = (
+            "up"
+        )
 
         risk_rank = 3
 
 
     elif score >= 0:
 
-        status = "🟡 様子見"
+        status = (
+            "🟡 様子見"
+        )
 
-        level = "neutral"
+        level = (
+            "neutral"
+        )
 
         risk_rank = 2
 
 
     elif score >= -2:
 
-        status = "🟠 注意"
+        status = (
+            "🟠 注意"
+        )
 
-        level = "warning"
+        level = (
+            "warning"
+        )
 
         risk_rank = 1
 
 
     else:
 
-        status = "🔴 危険"
+        status = (
+            "🔴 危険"
+        )
 
-        level = "danger"
+        level = (
+            "danger"
+        )
 
         risk_rank = 0
 
 
     return {
-        "ticker": ticker_code,
+        "ticker":
+            ticker_code,
 
-        "price": latest_price,
+        "price":
+            latest_price,
 
-        "previous_close": previous_close,
+        "previous_close":
+            previous_close,
 
-        "change": change,
+        "change":
+            change,
 
-        "change_pct": change_pct,
+        "change_pct":
+            change_pct,
 
-        "latest_date": latest_date,
+        "latest_date":
+            latest_date,
 
-        "latest_time": latest_time,
+        "latest_time":
+            latest_time,
 
-        "price_source": price_source,
+        "price_source":
+            price_source,
 
-        "synthetic": synthetic,
+        "synthetic":
+            synthetic,
 
-        "ma5": ma5,
+        "ma5":
+            ma5,
 
-        "ma25": ma25,
+        "ma25":
+            ma25,
 
-        "ma75": ma75,
+        "ma75":
+            ma75,
 
-        "recent_high": recent_high,
+        "recent_high":
+            recent_high,
 
-        "recent_low": recent_low,
+        "recent_low":
+            recent_low,
 
-        "prior_20_high": prior_20_high,
+        "prior_20_high":
+            prior_20_high,
 
-        "prior_20_low": prior_20_low,
+        "prior_20_low":
+            prior_20_low,
 
-        "volume_ratio": volume_ratio,
+        "volume_ratio":
+            volume_ratio,
 
-        "atr14": atr14,
+        "atr14":
+            atr14,
 
-        "stop_candidate": stop_candidate,
+        "stop_candidate":
+            stop_candidate,
 
-        "score": score,
+        "score":
+            score,
 
-        "status": status,
+        "status":
+            status,
 
-        "level": level,
+        "level":
+            level,
 
-        "risk_rank": risk_rank,
+        "risk_rank":
+            risk_rank,
 
-        "reasons": reasons,
+        "reasons":
+            reasons,
 
-        "daily": daily
+        "daily":
+            daily
     }
 
 
 # =========================================================
-# 逆指値・初期逆指値
+# 逆指値
+# 上がることはあるが、自動では下げない
 # =========================================================
 
 def get_stop_data(
@@ -1449,7 +1580,9 @@ def get_stop_data(
 ):
 
     candidate = round(
-        float(candidate)
+        float(
+            candidate
+        )
     )
 
 
@@ -1457,12 +1590,20 @@ def get_stop_data(
 
         try:
 
-            value = float(value)
+            value = float(
+                value
+            )
 
-            if pd.isna(value):
+
+            if pd.isna(
+                value
+            ):
+
                 return None
 
+
             return value
+
 
         except Exception:
 
@@ -1479,11 +1620,21 @@ def get_stop_data(
     )
 
 
+    # 既にstop_priceがある既存保有株なら、
+    # それを初期逆指値として採用
     if initial is None:
 
-        initial = float(
-            candidate
-        )
+        if saved is not None:
+
+            initial = float(
+                saved
+            )
+
+        else:
+
+            initial = float(
+                candidate
+            )
 
 
     if saved is None:
@@ -1492,11 +1643,14 @@ def get_stop_data(
             candidate
         )
 
+
     else:
 
         active = max(
             saved,
-            float(candidate)
+            float(
+                candidate
+            )
         )
 
 
@@ -1541,6 +1695,7 @@ def get_stop_data(
                 .execute()
             )
 
+
         except Exception:
 
             pass
@@ -1563,7 +1718,7 @@ def get_take_profit_lines(
 ):
 
     # 初期逆指値が買値より下なら
-    # 買値 - 初期逆指値を1Rとする
+    # 買値−逆指値＝1R
 
     if initial_stop < buy_price:
 
@@ -1572,11 +1727,10 @@ def get_take_profit_lines(
             - initial_stop
         )
 
+
     else:
 
-        # 登録時点ですでに十分含み益がある場合
-        # ATRまたは買値3%を基準にする
-
+        # すでに含み益がある状態で登録した場合など
         risk_per_share = max(
             atr14 * 1.5,
             buy_price * 0.03
@@ -1621,7 +1775,8 @@ def get_position_judgment(
         return (
             "🔴 売却・損切りを検討",
 
-            "逆指値ラインに到達または割れています。"
+            "現在値が逆指値ラインに到達または"
+            "割れています。"
         )
 
 
@@ -1630,8 +1785,9 @@ def get_position_judgment(
         return (
             "🎯 利確②到達",
 
-            "2Rの利確目安に到達。"
-            "残りの利確や逆指値引き上げを検討する水準です。"
+            "2Rの利確目安に到達しています。"
+            "残りの利確または逆指値引き上げを"
+            "検討する水準です。"
         )
 
 
@@ -1689,6 +1845,519 @@ def get_position_judgment(
 
 
 # =========================================================
+# 心理的な節目幅
+# =========================================================
+
+def get_price_step(price):
+
+    if price < 500:
+
+        return 10
+
+
+    elif price < 1000:
+
+        return 25
+
+
+    elif price < 5000:
+
+        return 100
+
+
+    elif price < 10000:
+
+        return 250
+
+
+    elif price < 30000:
+
+        return 500
+
+
+    else:
+
+        return 1000
+
+
+# =========================================================
+# 段階的な上値ルート
+#
+# 例：
+# 3066 → 3100 → 3200 → 3230〜3233 → 3305
+# =========================================================
+
+def build_price_route(
+    price,
+    prior_20_high,
+    tp1,
+    tp2
+):
+
+    step = get_price_step(
+        price
+    )
+
+
+    next_round = (
+        math.floor(
+            price / step
+        )
+        * step
+        + step
+    )
+
+
+    second_round = (
+        next_round
+        + step
+    )
+
+
+    levels = []
+
+
+    def add_level(
+        level,
+        label
+    ):
+
+        try:
+
+            level = float(
+                level
+            )
+
+
+        except Exception:
+
+            return
+
+
+        # 今の株価より上だけを
+        # 「これからの目標」として表示
+        if level <= price:
+
+            return
+
+
+        levels.append(
+            {
+                "price":
+                    level,
+
+                "label":
+                    label
+            }
+        )
+
+
+    # 心理的節目
+    add_level(
+        next_round,
+        "心理的節目"
+    )
+
+
+    add_level(
+        second_round,
+        "次の心理的節目"
+    )
+
+
+    # 実際の過去高値
+    add_level(
+        prior_20_high,
+        "20日高値"
+    )
+
+
+    # リスクリワード利確
+    add_level(
+        tp1,
+        "利確①"
+    )
+
+
+    add_level(
+        tp2,
+        "利確②"
+    )
+
+
+    levels.sort(
+        key=lambda x: x[
+            "price"
+        ]
+    )
+
+
+    # -----------------------------------------------------
+    # 近い価格を同じゾーンにまとめる
+    #
+    # 例：
+    # 利確① 3230
+    # 20日高値 3233
+    #
+    # → 3230〜3233円
+    # -----------------------------------------------------
+
+    cluster_distance = max(
+        5,
+        step * 0.10
+    )
+
+
+    zones = []
+
+
+    for level in levels:
+
+        if not zones:
+
+            zones.append(
+                {
+                    "low":
+                        level[
+                            "price"
+                        ],
+
+                    "high":
+                        level[
+                            "price"
+                        ],
+
+                    "labels":
+                        [
+                            level[
+                                "label"
+                            ]
+                        ]
+                }
+            )
+
+
+            continue
+
+
+        previous = zones[
+            -1
+        ]
+
+
+        if (
+            level[
+                "price"
+            ]
+            - previous[
+                "high"
+            ]
+            <= cluster_distance
+        ):
+
+            previous[
+                "high"
+            ] = level[
+                "price"
+            ]
+
+
+            if (
+                level[
+                    "label"
+                ]
+                not in previous[
+                    "labels"
+                ]
+            ):
+
+                previous[
+                    "labels"
+                ].append(
+                    level[
+                        "label"
+                    ]
+                )
+
+
+        else:
+
+            zones.append(
+                {
+                    "low":
+                        level[
+                            "price"
+                        ],
+
+                    "high":
+                        level[
+                            "price"
+                        ],
+
+                    "labels":
+                        [
+                            level[
+                                "label"
+                            ]
+                        ]
+                }
+            )
+
+
+    return {
+        "step":
+            step,
+
+        "next_round":
+            next_round,
+
+        "second_round":
+            second_round,
+
+        "zones":
+            zones
+    }
+
+
+# =========================================================
+# 保有情報編集
+# =========================================================
+
+def render_edit_controls(
+    row,
+    row_id,
+    key_prefix=""
+):
+
+    with st.expander(
+        "✏️ 保有情報を編集"
+    ):
+
+        edit_ticker = st.text_input(
+            "銘柄コード",
+
+            value=str(
+                row[
+                    "ticker"
+                ]
+            ),
+
+            key=(
+                f"{key_prefix}"
+                f"ticker_"
+                f"{row_id}"
+            )
+        )
+
+
+        edit_buy = st.number_input(
+            "買値",
+
+            min_value=0.0,
+
+            value=float(
+                row[
+                    "buy_price"
+                ]
+            ),
+
+            step=1.0,
+
+            key=(
+                f"{key_prefix}"
+                f"buy_"
+                f"{row_id}"
+            )
+        )
+
+
+        edit_shares = st.number_input(
+            "株数",
+
+            min_value=1,
+
+            value=int(
+                row[
+                    "shares"
+                ]
+            ),
+
+            step=1,
+
+            key=(
+                f"{key_prefix}"
+                f"shares_"
+                f"{row_id}"
+            )
+        )
+
+
+        if st.button(
+            "変更を保存",
+
+            key=(
+                f"{key_prefix}"
+                f"update_"
+                f"{row_id}"
+            )
+        ):
+
+            ticker_changed = (
+                edit_ticker.strip()
+                != str(
+                    row[
+                        "ticker"
+                    ]
+                ).strip()
+            )
+
+
+            buy_changed = (
+                float(
+                    edit_buy
+                )
+                != float(
+                    row[
+                        "buy_price"
+                    ]
+                )
+            )
+
+
+            update_data = {
+                "ticker":
+                    edit_ticker.strip(),
+
+                "buy_price":
+                    float(
+                        edit_buy
+                    ),
+
+                "shares":
+                    int(
+                        edit_shares
+                    )
+            }
+
+
+            # 銘柄または買値を変えたら
+            # 逆指値・利確基準を初期化
+            if (
+                ticker_changed
+                or buy_changed
+            ):
+
+                update_data.update(
+                    {
+                        "stop_price":
+                            None,
+
+                        "initial_stop_price":
+                            None,
+
+                        "tp1_done":
+                            False,
+
+                        "tp2_done":
+                            False
+                    }
+                )
+
+
+            (
+                supabase
+                .table(
+                    "portfolio"
+                )
+                .update(
+                    update_data
+                )
+                .eq(
+                    "id",
+                    row_id
+                )
+                .execute()
+            )
+
+
+            st.cache_data.clear()
+
+            st.rerun()
+
+
+        if st.button(
+            "🔄 逆指値・利確ラインを再計算",
+
+            key=(
+                f"{key_prefix}"
+                f"reset_"
+                f"{row_id}"
+            )
+        ):
+
+            (
+                supabase
+                .table(
+                    "portfolio"
+                )
+                .update(
+                    {
+                        "stop_price":
+                            None,
+
+                        "initial_stop_price":
+                            None,
+
+                        "tp1_done":
+                            False,
+
+                        "tp2_done":
+                            False
+                    }
+                )
+                .eq(
+                    "id",
+                    row_id
+                )
+                .execute()
+            )
+
+
+            st.cache_data.clear()
+
+            st.rerun()
+
+
+        if st.button(
+            "🗑️ この銘柄を削除",
+
+            key=(
+                f"{key_prefix}"
+                f"delete_"
+                f"{row_id}"
+            )
+        ):
+
+            (
+                supabase
+                .table(
+                    "portfolio"
+                )
+                .delete()
+                .eq(
+                    "id",
+                    row_id
+                )
+                .execute()
+            )
+
+
+            st.cache_data.clear()
+
+            st.rerun()
+
+
+# =========================================================
 # 保有株取得
 # =========================================================
 
@@ -1717,11 +2386,13 @@ except Exception as e:
         f"保有株取得エラー：{e}"
     )
 
+
     holdings = []
 
 
 # =========================================================
-# 前回監視データ
+# 前回GitHub自動監視データ
+# 株価取得失敗時の予備
 # =========================================================
 
 try:
@@ -1738,7 +2409,9 @@ try:
 
     alert_states = {
         str(
-            row["ticker"]
+            row[
+                "ticker"
+            ]
         ):
         row
 
@@ -1755,7 +2428,7 @@ except Exception:
 
 
 # =========================================================
-# 全登録銘柄
+# 全登録銘柄分析
 # =========================================================
 
 items = []
@@ -1773,7 +2446,7 @@ with st.spinner(
 
     for row in holdings:
 
-        code = str(
+        raw_code = str(
             row.get(
                 "ticker",
                 ""
@@ -1781,8 +2454,15 @@ with st.spinner(
         ).strip()
 
 
+        display_code = simple_ticker(
+            normalize_ticker(
+                raw_code
+            )
+        )
+
+
         name = get_company_name(
-            code
+            raw_code
         )
 
 
@@ -1813,7 +2493,7 @@ with st.spinner(
         try:
 
             analysis = analyze_stock(
-                code
+                raw_code
             )
 
 
@@ -1849,7 +2529,9 @@ with st.spinner(
                 active_stop,
                 initial_stop
             ) = get_stop_data(
-                row["id"],
+                row[
+                    "id"
+                ],
 
                 row.get(
                     "stop_price"
@@ -1933,6 +2615,16 @@ with st.spinner(
             )
 
 
+            route = build_price_route(
+                price=current_price,
+                prior_20_high=analysis[
+                    "prior_20_high"
+                ],
+                tp1=tp1,
+                tp2=tp2
+            )
+
+
             total_cost_known += cost
 
             total_value_known += value
@@ -1944,7 +2636,7 @@ with st.spinner(
                         row,
 
                     "code":
-                        code,
+                        display_code,
 
                     "name":
                         name,
@@ -2007,7 +2699,10 @@ with st.spinner(
                         judgment,
 
                     "judgment_reason":
-                        judgment_reason
+                        judgment_reason,
+
+                    "route":
+                        route
                 }
             )
 
@@ -2017,14 +2712,23 @@ with st.spinner(
             failed_count += 1
 
 
+            # -------------------------------------------------
+            # 最新取得失敗時は
+            # GitHub Actionsが保存した前回値を探す
+            # -------------------------------------------------
+
             state = (
                 alert_states.get(
-                    code
+                    raw_code
                 )
                 or
                 alert_states.get(
-                    simple_ticker(
-                        code
+                    display_code
+                )
+                or
+                alert_states.get(
+                    normalize_ticker(
+                        raw_code
                     )
                 )
             )
@@ -2047,6 +2751,7 @@ with st.spinner(
                         )
                     )
 
+
                 except Exception:
 
                     last_price = None
@@ -2067,6 +2772,7 @@ with st.spinner(
                             -1
                         )
                     )
+
 
                 except Exception:
 
@@ -2110,7 +2816,7 @@ with st.spinner(
                             row,
 
                         "code":
-                            code,
+                            display_code,
 
                         "name":
                             name,
@@ -2159,7 +2865,7 @@ with st.spinner(
                             row,
 
                         "code":
-                            code,
+                            display_code,
 
                         "name":
                             name,
@@ -2186,7 +2892,7 @@ with st.spinner(
 
 
 # =========================================================
-# 並び替え
+# 危険度順
 # =========================================================
 
 def sort_key(item):
@@ -2213,6 +2919,10 @@ items.sort(
 )
 
 
+# =========================================================
+# 登録状態
+# =========================================================
+
 st.caption(
     f"登録銘柄：{len(holdings)}銘柄 / "
     f"表示中：{len(items)}銘柄"
@@ -2220,7 +2930,7 @@ st.caption(
 
 
 # =========================================================
-# サマリー
+# 保有株サマリー
 # =========================================================
 
 if (
@@ -2274,6 +2984,7 @@ if (
             f"+{total_pct:.2f}%"
         )
 
+
     else:
 
         st.error(
@@ -2285,14 +2996,15 @@ if (
     if failed_count:
 
         st.caption(
-            f"※ {failed_count}銘柄は最新取得に失敗し、"
-            "前回値または登録情報を表示しています。"
+            f"※ {failed_count}銘柄は最新株価取得に失敗しています。"
+            "取得済みの前回値または登録情報を表示します。"
         )
 
 
     st.caption(
         "⚠️ 危険度の高い銘柄から表示"
     )
+
 
     st.divider()
 
@@ -2335,6 +3047,10 @@ for item in items:
     ]
 
 
+    # =====================================================
+    # 銘柄名
+    # =====================================================
+
     st.markdown(
         f"## {code}"
     )
@@ -2351,7 +3067,8 @@ for item in items:
 
 
     # =====================================================
-    # 株価取得失敗時
+    # 株価取得失敗
+    # 銘柄そのものは消さない
     # =====================================================
 
     if not item.get(
@@ -2416,12 +3133,23 @@ for item in items:
                     f"（+{item['profit_pct']:.2f}%）"
                 )
 
+
             else:
 
                 st.error(
                     f"参考損益： "
                     f"{item['profit']:,.0f}円 "
                     f"（{item['profit_pct']:.2f}%）"
+                )
+
+
+            if item.get(
+                "last_updated"
+            ):
+
+                st.caption(
+                    "前回データ："
+                    f"{item['last_updated']}"
                 )
 
 
@@ -2456,19 +3184,30 @@ for item in items:
             )
 
 
+        render_edit_controls(
+            row,
+            row_id,
+            key_prefix="error_"
+        )
+
+
         st.divider()
 
         continue
 
 
     # =====================================================
-    # 通常表示
+    # 正常取得
     # =====================================================
 
     a = item[
         "analysis"
     ]
 
+
+    # =====================================================
+    # 現在値
+    # =====================================================
 
     c1, c2 = st.columns(
         2
@@ -2507,6 +3246,10 @@ for item in items:
     )
 
 
+    # =====================================================
+    # 損益
+    # =====================================================
+
     if item[
         "profit"
     ] >= 0:
@@ -2516,6 +3259,7 @@ for item in items:
             f"+{item['profit']:,.0f}円 "
             f"（+{item['profit_pct']:.2f}%）"
         )
+
 
     else:
 
@@ -2542,7 +3286,7 @@ for item in items:
 
     if (
         "🔴" in judgment
-        or "売却" in judgment
+        or "損切り" in judgment
     ):
 
         st.error(
@@ -2597,8 +3341,8 @@ for item in items:
 
         st.error(
             "🚨 逆指値ライン到達・割れ\n\n"
-            f"逆指値：**{active_stop:,.0f}円**\n\n"
-            f"現在値：**{a['price']:,.0f}円**"
+            f"逆指値： **{active_stop:,.0f}円**\n\n"
+            f"現在値： **{a['price']:,.0f}円**"
         )
 
 
@@ -2606,8 +3350,8 @@ for item in items:
 
         st.warning(
             "⚠️ 逆指値ライン接近\n\n"
-            f"逆指値：**{active_stop:,.0f}円**\n\n"
-            f"あと：**{gap_yen:,.0f}円 "
+            f"逆指値： **{active_stop:,.0f}円**\n\n"
+            f"あと： **{gap_yen:,.0f}円 "
             f"（{gap_pct:.2f}%）**"
         )
 
@@ -2630,7 +3374,7 @@ for item in items:
 
 
     # =====================================================
-    # 利確
+    # 利確ライン
     # =====================================================
 
     st.markdown(
@@ -2722,8 +3466,209 @@ for item in items:
 
 
     # =====================================================
+    # 段階的な上値ルート
+    # =====================================================
+
+    st.markdown(
+        "### 🪜 上値ルート"
+    )
+
+
+    route = item[
+        "route"
+    ]
+
+
+    zones = route[
+        "zones"
+    ]
+
+
+    if not zones:
+
+        st.success(
+            "現在の主要な上値目標をすでに突破しています。"
+            "新しい高値形成を確認する局面です。"
+        )
+
+
+    else:
+
+        for index, zone in enumerate(
+            zones[:5]
+        ):
+
+            low = zone[
+                "low"
+            ]
+
+
+            high = zone[
+                "high"
+            ]
+
+
+            labels = "・".join(
+                zone[
+                    "labels"
+                ]
+            )
+
+
+            if (
+                abs(
+                    high - low
+                )
+                < 1
+            ):
+
+                price_text = (
+                    f"{low:,.0f}円"
+                )
+
+
+            else:
+
+                price_text = (
+                    f"{low:,.0f}"
+                    f"〜"
+                    f"{high:,.0f}円"
+                )
+
+
+            distance = (
+                low
+                - a[
+                    "price"
+                ]
+            )
+
+
+            distance_pct = (
+                distance
+                / a[
+                    "price"
+                ]
+                * 100
+            )
+
+
+            if index == 0:
+
+                st.info(
+                    "① 次に超えたいライン\n\n"
+                    f"**{price_text}**\n\n"
+                    f"{labels}\n\n"
+                    f"あと "
+                    f"**{distance:,.0f}円 "
+                    f"（{distance_pct:.2f}%）**"
+                )
+
+
+            elif index == 1:
+
+                st.write(
+                    "② 突破後の目標： "
+                    f"**{price_text}** "
+                    f"（{labels}）"
+                )
+
+
+            else:
+
+                st.write(
+                    f"{index + 1}️⃣ "
+                    f"**{price_text}** "
+                    f"（{labels}）"
+                )
+
+
+        # -------------------------------------------------
+        # 今どう見るか
+        # -------------------------------------------------
+
+        first_zone = (
+            zones[
+                0
+            ]
+        )
+
+
+        first_price = (
+            first_zone[
+                "low"
+            ]
+        )
+
+
+        distance_to_first = (
+            first_price
+            - a[
+                "price"
+            ]
+        ) / a[
+            "price"
+        ] * 100
+
+
+        st.markdown(
+            "#### 🧭 今の見方"
+        )
+
+
+        if distance_to_first <= 1:
+
+            st.warning(
+                f"現在値は次の節目 "
+                f"**{first_price:,.0f}円** のすぐ下です。"
+                "ここを突破して、その上で維持できるかを"
+                "確認する局面です。"
+            )
+
+
+        elif (
+            a[
+                "level"
+            ]
+            in [
+                "strong",
+                "up"
+            ]
+        ):
+
+            st.success(
+                f"上昇トレンド中です。まず "
+                f"**{first_price:,.0f}円** を目標にし、"
+                "突破できれば次のゾーンを狙う形です。"
+            )
+
+
+        else:
+
+            st.warning(
+                f"まず "
+                f"**{first_price:,.0f}円** まで戻せるかを確認。"
+                "トレンドが弱い間は、"
+                "遠い利確目標より逆指値管理を優先します。"
+            )
+
+
+        st.caption(
+            "心理的なキリ番・20日高値・"
+            "利確①/②を現在値から近い順に並べています。"
+            "株価が節目を超えると、その価格は消えて"
+            "次の目標へ自動的に進みます。"
+        )
+
+
+    # =====================================================
     # テクニカル判定
     # =====================================================
+
+    st.markdown(
+        "### 📊 テクニカル判定"
+    )
+
 
     if a[
         "level"
@@ -2763,7 +3708,7 @@ for item in items:
 
 
     # =====================================================
-    # ニュース
+    # 関連ニュース
     # =====================================================
 
     with st.expander(
@@ -2831,7 +3776,6 @@ for item in items:
 
             st.link_button(
                 "記事を開く",
-
                 n[
                     "url"
                 ]
@@ -2842,7 +3786,7 @@ for item in items:
 
 
     # =====================================================
-    # 詳細
+    # 詳細分析
     # =====================================================
 
     with st.expander(
@@ -2868,6 +3812,17 @@ for item in items:
             st.write(
                 "最終データ時刻： "
                 f"**{a['latest_time'].strftime('%H:%M')}**"
+            )
+
+
+        if a[
+            "synthetic"
+        ]:
+
+            st.warning(
+                "Yahooの日足更新が遅れているため、"
+                "1分足などから最新営業日のデータを"
+                "補完しています。"
             )
 
 
@@ -2908,6 +3863,12 @@ for item in items:
 
 
         st.write(
+            f"出来高20日平均比： "
+            f"**{a['volume_ratio']:.2f}倍**"
+        )
+
+
+        st.write(
             f"ATR： "
             f"**{a['atr14']:,.0f}円**"
         )
@@ -2918,6 +3879,10 @@ for item in items:
             f"**{a['score']}**"
         )
 
+
+        # -------------------------------------------------
+        # 逆指値・利確詳細
+        # -------------------------------------------------
 
         st.markdown(
             "#### 🛡️ 逆指値・利確計算"
@@ -2931,13 +3896,13 @@ for item in items:
 
 
         st.write(
-            f"現在保存中： "
+            f"現在保存中の逆指値： "
             f"**{active_stop:,.0f}円**"
         )
 
 
         st.write(
-            f"今回計算候補： "
+            f"今回の逆指値計算候補： "
             f"**{a['stop_candidate']:,.0f}円**"
         )
 
@@ -2956,9 +3921,18 @@ for item in items:
         ):
 
             st.success(
-                "今回候補は下がっていますが、"
+                "今回の計算候補は下がっていますが、"
                 "保存済みの逆指値を維持しています。"
             )
+
+
+        # -------------------------------------------------
+        # チャート
+        # -------------------------------------------------
+
+        st.markdown(
+            "#### 📈 チャート"
+        )
 
 
         chart = (
@@ -2991,6 +3965,10 @@ for item in items:
         )
 
 
+        # -------------------------------------------------
+        # 判定理由
+        # -------------------------------------------------
+
         st.markdown(
             "#### 🔍 判定理由"
         )
@@ -3009,213 +3987,17 @@ for item in items:
     # 編集
     # =====================================================
 
-    with st.expander(
-        "✏️ 保有情報を編集"
-    ):
-
-        edit_ticker = st.text_input(
-            "銘柄コード",
-
-            value=str(
-                row[
-                    "ticker"
-                ]
-            ),
-
-            key=f"ticker_{row_id}"
-        )
-
-
-        edit_buy = st.number_input(
-            "買値",
-
-            min_value=0.0,
-
-            value=float(
-                row[
-                    "buy_price"
-                ]
-            ),
-
-            step=1.0,
-
-            key=f"buy_{row_id}"
-        )
-
-
-        edit_shares = st.number_input(
-            "株数",
-
-            min_value=1,
-
-            value=int(
-                row[
-                    "shares"
-                ]
-            ),
-
-            step=1,
-
-            key=f"shares_{row_id}"
-        )
-
-
-        if st.button(
-            "変更を保存",
-
-            key=f"update_{row_id}"
-        ):
-
-            ticker_changed = (
-                edit_ticker.strip()
-                != str(
-                    row[
-                        "ticker"
-                    ]
-                ).strip()
-            )
-
-
-            buy_changed = (
-                float(
-                    edit_buy
-                )
-                != float(
-                    row[
-                        "buy_price"
-                    ]
-                )
-            )
-
-
-            update_data = {
-                "ticker":
-                    edit_ticker.strip(),
-
-                "buy_price":
-                    float(
-                        edit_buy
-                    ),
-
-                "shares":
-                    int(
-                        edit_shares
-                    )
-            }
-
-
-            if (
-                ticker_changed
-                or buy_changed
-            ):
-
-                update_data.update(
-                    {
-                        "stop_price":
-                            None,
-
-                        "initial_stop_price":
-                            None,
-
-                        "tp1_done":
-                            False,
-
-                        "tp2_done":
-                            False
-                    }
-                )
-
-
-            (
-                supabase
-                .table(
-                    "portfolio"
-                )
-                .update(
-                    update_data
-                )
-                .eq(
-                    "id",
-                    row_id
-                )
-                .execute()
-            )
-
-
-            st.cache_data.clear()
-
-            st.rerun()
-
-
-        if st.button(
-            "🔄 逆指値・利確ラインを再計算",
-
-            key=f"reset_stop_{row_id}"
-        ):
-
-            (
-                supabase
-                .table(
-                    "portfolio"
-                )
-                .update(
-                    {
-                        "stop_price":
-                            None,
-
-                        "initial_stop_price":
-                            None,
-
-                        "tp1_done":
-                            False,
-
-                        "tp2_done":
-                            False
-                    }
-                )
-                .eq(
-                    "id",
-                    row_id
-                )
-                .execute()
-            )
-
-
-            st.cache_data.clear()
-
-            st.rerun()
-
-
-        if st.button(
-            "🗑️ この銘柄を削除",
-
-            key=f"delete_{row_id}"
-        ):
-
-            (
-                supabase
-                .table(
-                    "portfolio"
-                )
-                .delete()
-                .eq(
-                    "id",
-                    row_id
-                )
-                .execute()
-            )
-
-
-            st.cache_data.clear()
-
-            st.rerun()
+    render_edit_controls(
+        row,
+        row_id
+    )
 
 
     st.divider()
 
 
 # =========================================================
-# 新規追加
+# 新規保有株追加
 # =========================================================
 
 st.subheader(
@@ -3311,7 +4093,7 @@ if st.button(
 
 
 # =========================================================
-# 更新
+# 手動更新
 # =========================================================
 
 st.divider()
@@ -3328,7 +4110,7 @@ if st.button(
 
 
 st.caption(
-    "保有・売却判断、逆指値、利確ラインは"
+    "保有・売却判断、逆指値、利確ライン、上値ルートは"
     "テクニカル指標を使った参考情報です。"
-    "実際の注文前には証券会社の価格も確認してください。"
+    "実際の注文前には証券会社の株価も確認してください。"
 )
