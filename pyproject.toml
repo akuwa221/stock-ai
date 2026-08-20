@@ -10,6 +10,7 @@ dependencies = [
     "pandas",
     "supabase",
     "requests",
+    "xlrd>=2.0.1",
 ]
 
 [tool.uv]

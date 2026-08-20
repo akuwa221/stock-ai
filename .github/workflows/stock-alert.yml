@@ -20,11 +20,14 @@ on:
     - cron: "45 6 * * 1-5"
 
 jobs:
+
   stock-alert:
+
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -36,7 +39,7 @@ jobs:
       - name: Install packages
         run: |
           python -m pip install --upgrade pip
-          pip install yfinance pandas supabase requests
+          pip install yfinance pandas supabase requests xlrd
 
       - name: Check portfolio
         env:
