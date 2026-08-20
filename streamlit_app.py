@@ -599,6 +599,14 @@ def analyze_stock(code, saved_breakout_level=None, previous_danger_streak=0):
     change = latest_price - previous_close
     change_pct = change / previous_close * 100
 
+    # 場中は前日終値、引け後は最新終値を「確定終値」として使う。
+    # 警戒ラインを終値で割ったかどうかの判定に使用する。
+    confirmed_close = (
+        previous_close
+        if market_open
+        else float(daily["Close"].iloc[-1])
+    )
+
     daily["MA5"] = daily["Close"].rolling(5).mean()
     daily["MA25"] = daily["Close"].rolling(25).mean()
     daily["MA75"] = daily["Close"].rolling(75).mean()
@@ -786,6 +794,7 @@ def analyze_stock(code, saved_breakout_level=None, previous_danger_streak=0):
         "ticker": ticker_code,
         "price": latest_price,
         "previous_close": previous_close,
+        "confirmed_close": confirmed_close,
         "change": change,
         "change_pct": change_pct,
         "latest_date": latest_date,
@@ -825,32 +834,95 @@ def analyze_stock(code, saved_breakout_level=None, previous_danger_streak=0):
 
 
 # =========================================================
-# 逆指値保存
+# 2段階防御ライン保存
+#
+# stop_price       = 警戒ライン
+# final_exit_price = 最終撤退ライン
+#
+# どちらも一度上がったら自動では下げない。
 # =========================================================
 
-def get_stop_data(row_id, saved_stop, saved_initial_stop, candidate):
-    candidate = round(float(candidate))
-    saved = clean_float(saved_stop)
+def get_stop_data(
+    row_id,
+    saved_stop,
+    saved_initial_stop,
+    saved_final_exit,
+    warning_candidate,
+    atr14,
+):
+    warning_candidate = round(float(warning_candidate))
+    saved_warning = clean_float(saved_stop)
     initial = clean_float(saved_initial_stop)
+    saved_final = clean_float(saved_final_exit)
 
+    # 利確計算用の初期ラインは従来通り固定。
     if initial is None:
-        initial = float(saved) if saved is not None else float(candidate)
+        initial = (
+            float(saved_warning)
+            if saved_warning is not None
+            else float(warning_candidate)
+        )
 
-    active = float(candidate) if saved is None else max(saved, float(candidate))
+    # 警戒ラインは上方向にだけ追従。
+    active_warning = (
+        float(warning_candidate)
+        if saved_warning is None
+        else max(saved_warning, float(warning_candidate))
+    )
+
+    # 最終撤退ラインは警戒ラインよりさらに下。
+    # 「0.5ATR」か「警戒ラインの1.5%」の大きい方だけ余裕を持たせる。
+    final_gap = max(
+        float(atr14) * 0.50,
+        active_warning * 0.015,
+    )
+    final_candidate = round(
+        active_warning - final_gap
+    )
+
+    # 必ず警戒ラインより下に置く。
+    final_candidate = min(
+        final_candidate,
+        round(active_warning * 0.985),
+    )
+
+    # 最終撤退ラインも一度上げたら自動では下げない。
+    active_final = (
+        float(final_candidate)
+        if saved_final is None
+        else max(saved_final, float(final_candidate))
+    )
+
+    # 念のため警戒ライン以上にならないようにする。
+    active_final = min(
+        active_final,
+        active_warning - 1,
+    )
 
     update_data = {}
+
     if clean_float(saved_initial_stop) is None:
         update_data["initial_stop_price"] = initial
-    if saved is None or active > saved:
-        update_data["stop_price"] = active
+
+    if saved_warning is None or active_warning > saved_warning:
+        update_data["stop_price"] = active_warning
+
+    if saved_final is None or active_final > saved_final:
+        update_data["final_exit_price"] = active_final
 
     if update_data:
         try:
-            supabase.table("portfolio").update(update_data).eq("id", row_id).execute()
+            (
+                supabase
+                .table("portfolio")
+                .update(update_data)
+                .eq("id", row_id)
+                .execute()
+            )
         except Exception:
             pass
 
-    return active, initial
+    return active_warning, initial, active_final
 
 
 # =========================================================
@@ -876,41 +948,81 @@ def get_position_judgment(
     price,
     buy_price,
     score,
-    active_stop,
-    stop_gap_pct,
+    warning_line,
+    warning_gap_pct,
+    final_exit_line,
     tp1,
     tp2,
     downside_risk,
     breakdown_confirmed,
+    confirmed_close,
 ):
-    if price <= active_stop:
-        return "🔴 売却・損切りを検討", "現在値が逆指値ラインに到達または割れています。"
+    final_breached = price <= final_exit_line
+    warning_breached = price <= warning_line
+    warning_close_breached = confirmed_close <= warning_line
+
+    # 最終撤退ラインは最優先。
+    if final_breached:
+        return (
+            "🔴 最終撤退ライン到達・売却を強く検討",
+            "通常の値動きより深い下落です。最終撤退ラインに到達しているため、保有継続より損失限定を優先する局面です。",
+        )
 
     if price >= tp2:
-        return "🎯 利確②到達", "2Rの利確目安に到達。残りの利確や逆指値引き上げを検討する水準です。"
+        return (
+            "🎯 利確②到達",
+            "2Rの利確目安に到達。残りの利確や防御ライン引き上げを検討する水準です。",
+        )
 
     if price >= tp1:
-        return "🟢 一部利確を検討", "1.5Rの利確目安に到達しています。"
+        return (
+            "🟢 一部利確を検討",
+            "1.5Rの利確目安に到達しています。",
+        )
 
-    # V7: 売却判断は旧トレンド色ではなく、実績の出た下落継続リスクを優先。
-    # 高リスク帯は20日以内-5%の発生率が大きく上がったため明確に警戒する。
-    # ただしサンプル数はまだ少ないため、高リスクだけで即全売却にはしない。
+    # 警戒ラインを終値で割り、下落継続リスクも高い。
+    if warning_close_breached and downside_risk >= 4:
+        return (
+            "🔴 警戒ライン終値割れ・一部撤退を強く検討",
+            "警戒ラインを確定終値で下回り、下落継続リスクも高い状態です。最終撤退ラインまで待たず、一部撤退を強く検討する局面です。",
+        )
+
+    # 警戒ラインを終値で割り、注意帯以上。
+    if warning_close_breached and downside_risk >= 2:
+        return (
+            "🟠 警戒ライン終値割れ・一部撤退を検討",
+            "警戒ラインを確定終値で下回り、下落継続リスクも注意帯です。反発が弱ければ一部撤退を検討します。",
+        )
+
+    # 場中に警戒ラインを割っただけなら即売却しない。
+    if warning_breached:
+        if downside_risk >= 4:
+            return (
+                "🟠 警戒ライン割れ・強く警戒",
+                "場中に警戒ラインを割れています。ただし一瞬の割れだけでは即売却せず、終値と下落継続リスクを確認します。",
+            )
+        return (
+            "🟡 警戒ライン割れ・反発確認",
+            "警戒ラインを下回っていますが、下落継続リスクが高くなければ即売却せず、反発または終値での割れを確認します。",
+        )
+
+    # ライン未到達でも高リスクなら警戒。
     if downside_risk >= 4 and breakdown_confirmed:
         return (
-            "🔴 売却・一部撤退を強く検討",
-            "下落継続リスクが高く、20日安値も明確に割っています。逆指値到達を待つだけでなく一部撤退も検討する局面です。",
+            "🔴 強く警戒・一部撤退を検討",
+            "下落継続リスクが高く、20日安値も明確に割っています。警戒ライン到達前でも一部撤退を検討する局面です。",
         )
 
     if downside_risk >= 4:
         return (
-            "🔴 強く警戒・一部撤退を検討",
-            "バックテストで高リスク帯は20日以内の大きな下落が増えました。全売却を即断せず、逆指値と一部撤退を優先します。",
+            "🟠 強く警戒",
+            "バックテストで高リスク帯は大きな下落が増えました。警戒ラインと最終撤退ラインを確認しながら保有します。",
         )
 
-    if downside_risk >= 2 or stop_gap_pct <= 2:
+    if downside_risk >= 2 or warning_gap_pct <= 2:
         return (
             "🟠 保有継続・警戒",
-            "下落継続リスクは注意帯です。逆指値を維持し、安値割れ・出来高を確認します。",
+            "下落継続リスクは注意帯、または警戒ラインが近い状態です。安値割れ・出来高・終値を確認します。",
         )
 
     if score <= -3:
@@ -920,9 +1032,15 @@ def get_position_judgment(
         )
 
     if price < buy_price and score <= 0:
-        return "🟡 保有継続・警戒", "買値を下回っているため、上昇確認までは警戒が必要です。"
+        return (
+            "🟡 保有継続・警戒",
+            "買値を下回っているため、上昇確認までは警戒が必要です。",
+        )
 
-    return "🟢 保有継続", "現時点では保有継続を優先できる状態です。"
+    return (
+        "🟢 保有継続",
+        "現時点では保有継続を優先できる状態です。",
+    )
 
 
 # =========================================================
@@ -2073,6 +2191,7 @@ def render_edit_controls(row, row_id, key_prefix=""):
                     {
                         "stop_price": None,
                         "initial_stop_price": None,
+                        "final_exit_price": None,
                         "tp1_done": False,
                         "tp2_done": False,
                     }
@@ -2082,11 +2201,12 @@ def render_edit_controls(row, row_id, key_prefix=""):
             st.cache_data.clear()
             st.rerun()
 
-        if st.button("🔄 逆指値・利確ラインを再計算", key=f"{key_prefix}reset_{row_id}"):
+        if st.button("🔄 防御ライン・利確ラインを再計算", key=f"{key_prefix}reset_{row_id}"):
             supabase.table("portfolio").update(
                 {
                     "stop_price": None,
                     "initial_stop_price": None,
+                    "final_exit_price": None,
                     "tp1_done": False,
                     "tp2_done": False,
                 }
@@ -2157,15 +2277,24 @@ with st.spinner("保有株を分析しています..."):
             profit = value - cost
             profit_pct = profit / cost * 100 if cost > 0 else 0
 
-            active_stop, initial_stop = get_stop_data(
+            active_stop, initial_stop, final_exit = get_stop_data(
                 row["id"],
                 row.get("stop_price"),
                 row.get("initial_stop_price"),
+                row.get("final_exit_price"),
                 analysis["stop_candidate"],
+                analysis["atr14"],
             )
 
             stop_gap_yen = current_price - active_stop
             stop_gap_pct = stop_gap_yen / current_price * 100
+
+            final_exit_gap_yen = current_price - final_exit
+            final_exit_gap_pct = final_exit_gap_yen / current_price * 100
+
+            warning_breached = current_price <= active_stop
+            warning_close_breached = analysis["confirmed_close"] <= active_stop
+            final_exit_breached = current_price <= final_exit
 
             risk_per_share, tp1, tp2 = get_take_profit_lines(
                 buy_price,
@@ -2184,10 +2313,12 @@ with st.spinner("保有株を分析しています..."):
                 analysis["score"],
                 active_stop,
                 stop_gap_pct,
+                final_exit,
                 tp1,
                 tp2,
                 analysis["downside_risk"],
                 analysis["breakdown_confirmed"],
+                analysis["confirmed_close"],
             )
 
             route = build_price_route(
@@ -2215,8 +2346,14 @@ with st.spinner("保有株を分析しています..."):
                     "profit_pct": profit_pct,
                     "active_stop": active_stop,
                     "initial_stop": initial_stop,
+                    "final_exit": final_exit,
                     "stop_gap_yen": stop_gap_yen,
                     "stop_gap_pct": stop_gap_pct,
+                    "final_exit_gap_yen": final_exit_gap_yen,
+                    "final_exit_gap_pct": final_exit_gap_pct,
+                    "warning_breached": warning_breached,
+                    "warning_close_breached": warning_close_breached,
+                    "final_exit_breached": final_exit_breached,
                     "risk_per_share": risk_per_share,
                     "tp1": tp1,
                     "tp2": tp2,
@@ -2395,33 +2532,66 @@ for item in items:
     st.caption(item["judgment_reason"])
 
     # -----------------------------------------------------
-    # 逆指値
+    # 2段階防御ライン
     # -----------------------------------------------------
+    st.markdown("### 🛡️ 2段階防御ライン")
+
     active_stop = item["active_stop"]
     gap_yen = item["stop_gap_yen"]
     gap_pct = item["stop_gap_pct"]
 
-    if gap_yen <= 0:
+    final_exit = item["final_exit"]
+    final_gap_yen = item["final_exit_gap_yen"]
+    final_gap_pct = item["final_exit_gap_pct"]
+
+    if item["final_exit_breached"]:
         st.error(
-            "🚨 逆指値ライン到達・割れ\n\n"
-            f"逆指値： **{active_stop:,.0f}円**\n\n"
+            "🚨 **最終撤退ライン到達・割れ**\n\n"
+            f"最終撤退ライン： **{final_exit:,.0f}円**\n\n"
             f"現在値： **{a['price']:,.0f}円**"
         )
+    elif item["warning_breached"]:
+        if item["warning_close_breached"]:
+            st.error(
+                "⚠️ **警戒ラインを確定終値でも割れています**\n\n"
+                f"警戒ライン： **{active_stop:,.0f}円**\n\n"
+                f"確定終値： **{a['confirmed_close']:,.0f}円**"
+            )
+        else:
+            st.warning(
+                "⚠️ **警戒ラインを場中に割れています**\n\n"
+                f"警戒ライン： **{active_stop:,.0f}円**\n\n"
+                "一瞬の割れだけでは即売却せず、終値と下落継続リスクを確認します。"
+            )
     elif gap_pct <= 2:
         st.warning(
-            "⚠️ 逆指値ライン接近\n\n"
-            f"逆指値： **{active_stop:,.0f}円**\n\n"
+            "⚠️ **警戒ライン接近**\n\n"
+            f"警戒ライン： **{active_stop:,.0f}円**\n\n"
             f"あと： **{gap_yen:,.0f}円 （{gap_pct:.2f}%）**"
         )
     else:
         st.info(
-            f"🛡️ 逆指値： **{active_stop:,.0f}円**\n\n"
+            f"⚠️ 警戒ライン： **{active_stop:,.0f}円**\n\n"
             f"現在値まで： **{gap_yen:,.0f}円 （{gap_pct:.2f}%）**"
         )
 
+    st.error(
+        f"🚨 最終撤退ライン： **{final_exit:,.0f}円**\n\n"
+        f"現在値まで： **{final_gap_yen:,.0f}円 （{final_gap_pct:.2f}%）**"
+    )
+
     st.caption(
-        f"現在の逆指値設定：{a['stop_profile_text']} "
-        f"（ATR × {a['stop_atr_multiplier']:.2f}）"
+        f"警戒ラインは現在の下落継続リスクに合わせて計算 "
+        f"（ATR × {a['stop_atr_multiplier']:.2f}）。"
+    )
+    st.caption(
+        "最終撤退ラインは、警戒ラインからさらに0.5ATR以上"
+        "（最低1.5%）下に置きます。"
+    )
+    st.caption(
+        "警戒ラインを一瞬割っただけでは即売却しません。"
+        "『確定終値でも警戒ライン割れ＋下落継続リスクが注意以上』で"
+        "一部撤退を検討し、最終撤退ライン到達では売却判断を強めます。"
     )
 
     st.markdown("#### 🚨 下落継続リスク")
@@ -2440,9 +2610,9 @@ for item in items:
 
     st.caption(
         "テクニカルの『危険』は現在のトレンドの弱さを表します。"
-        "売却判断と逆指値の引き締めは、この下落継続リスクを優先します。"
+        "売却判断は、警戒ライン・最終撤退ライン・下落継続リスクを組み合わせます。"
     )
-    st.caption("一度引き上げた逆指値は、判定が改善しても自動では下がりません。")
+    st.caption("一度引き上げた2本の防御ラインは、判定が改善しても自動では下がりません。")
 
     # -----------------------------------------------------
     # 利確
@@ -2612,11 +2782,12 @@ for item in items:
         st.write(f"ATR： **{a['atr14']:,.0f}円**")
         st.write(f"判定スコア： **{a['score']}**")
 
-        st.markdown("#### 🛡️ 逆指値詳細")
-        st.write(f"初期逆指値： **{item['initial_stop']:,.0f}円**")
-        st.write(f"現在保存中： **{active_stop:,.0f}円**")
+        st.markdown("#### 🛡️ 2段階防御ライン詳細")
+        st.write(f"初期警戒ライン： **{item['initial_stop']:,.0f}円**")
+        st.write(f"現在の警戒ライン： **{active_stop:,.0f}円**")
+        st.write(f"最終撤退ライン： **{item['final_exit']:,.0f}円**")
         st.write(f"通常の広め候補： **{a['base_stop_candidate']:,.0f}円**")
-        st.write(f"現在判定を反映した候補： **{a['stop_candidate']:,.0f}円**")
+        st.write(f"現在判定を反映した警戒候補： **{a['stop_candidate']:,.0f}円**")
         st.write(f"現在ATR倍率： **{a['stop_atr_multiplier']:.2f}倍**")
         st.write(f"下落継続リスク： **{a['downside_label']} / {a['downside_risk']}点**")
         st.write(f"25日線5日傾き： **{a['ma25_slope_pct']:+.2f}%**")
@@ -2624,7 +2795,7 @@ for item in items:
         st.write(f"初期リスク： **{item['risk_per_share']:,.0f}円/株**")
 
         if a["stop_candidate"] < active_stop:
-            st.success("今回の計算候補は保存済み逆指値より低いため、逆指値を下げず維持しています。")
+            st.success("今回の計算候補は保存済み警戒ラインより低いため、警戒ラインを下げず維持しています。")
 
         st.markdown("#### 📈 チャート")
         chart = a["daily"].tail(130)[["Close", "MA5", "MA25", "MA75"]].copy()
@@ -2661,6 +2832,7 @@ if st.button("保存する", type="primary"):
                 "shares": int(new_shares),
                 "stop_price": None,
                 "initial_stop_price": None,
+                "final_exit_price": None,
                 "tp1_done": False,
                 "tp2_done": False,
             }
@@ -2679,6 +2851,6 @@ if st.button("🔄 最新情報に更新", key="bottom_refresh", use_container_w
     st.rerun()
 
 st.caption(
-    "保有・売却判断、逆指値、利確ライン、抵抗線・突破判定は"
+    "保有・売却判断、防御ライン、利確ライン、抵抗線・突破判定は"
     "テクニカル指標による参考情報です。実際の注文前には証券会社の価格も確認してください。"
 )

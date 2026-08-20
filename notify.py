@@ -374,6 +374,12 @@ def check_stock(row, previous_state=None):
     previous_close = float(daily["Close"].iloc[-2])
     change_pct = (price - previous_close) / previous_close * 100
 
+    confirmed_close = (
+        previous_close
+        if market_open
+        else float(daily["Close"].iloc[-1])
+    )
+
     closes = daily["Close"]
     ma5 = float(closes.rolling(5).mean().iloc[-1])
     ma25 = float(closes.rolling(25).mean().iloc[-1])
@@ -486,22 +492,48 @@ def check_stock(row, previous_state=None):
 
     saved_stop = clean_float(row.get("stop_price"))
     initial_stop = clean_float(row.get("initial_stop_price"))
+    saved_final_exit = clean_float(row.get("final_exit_price"))
 
     if initial_stop is None:
         initial_stop = float(saved_stop) if saved_stop is not None else float(stop_candidate)
 
+    # stop_price は警戒ラインとして使う。
     active_stop = float(stop_candidate) if saved_stop is None else max(saved_stop, float(stop_candidate))
+
+    # 最終撤退ライン：警戒ラインからさらに0.5ATR以上（最低1.5%）下。
+    final_gap = max(
+        atr14 * 0.50,
+        active_stop * 0.015,
+    )
+    final_exit_candidate = round(active_stop - final_gap)
+    final_exit_candidate = min(
+        final_exit_candidate,
+        round(active_stop * 0.985),
+    )
+
+    active_final_exit = (
+        float(final_exit_candidate)
+        if saved_final_exit is None
+        else max(saved_final_exit, float(final_exit_candidate))
+    )
+    active_final_exit = min(
+        active_final_exit,
+        active_stop - 1,
+    )
 
     portfolio_update = {}
     if clean_float(row.get("initial_stop_price")) is None:
         portfolio_update["initial_stop_price"] = initial_stop
     if saved_stop is None or active_stop > saved_stop:
         portfolio_update["stop_price"] = active_stop
+    if saved_final_exit is None or active_final_exit > saved_final_exit:
+        portfolio_update["final_exit_price"] = active_final_exit
 
     if portfolio_update:
         supabase.table("portfolio").update(portfolio_update).eq("id", row["id"]).execute()
 
     stop_distance = (price - active_stop) / price * 100
+    final_exit_distance = (price - active_final_exit) / price * 100
 
     buy_price = float(row["buy_price"])
     risk, tp1, tp2 = get_take_profit_lines(buy_price, initial_stop, atr14)
@@ -509,6 +541,8 @@ def check_stock(row, previous_state=None):
     sudden_drop = change_pct <= -3
     stop_near = stop_distance <= 2
     stop_breached = price <= active_stop
+    warning_close_breached = confirmed_close <= active_stop
+    final_exit_breached = price <= active_final_exit
     breakdown = price < prior_20_low
 
     confirmed_level = round_state["recent_confirmed_level"]
@@ -536,8 +570,12 @@ def check_stock(row, previous_state=None):
         "prior_20_low": prior_20_low,
         "stop_price": active_stop,
         "stop_distance": stop_distance,
+        "final_exit_price": active_final_exit,
+        "final_exit_distance": final_exit_distance,
         "stop_near": stop_near,
         "stop_breached": stop_breached,
+        "warning_close_breached": warning_close_breached,
+        "final_exit_breached": final_exit_breached,
         "sudden_drop": sudden_drop,
         "breakdown": breakdown,
         "risk": risk,
@@ -606,15 +644,39 @@ for row in holdings:
     if current["sudden_drop"] and not previous_drop:
         reasons.append(f"前日比 {current['change_pct']:.2f}%")
 
-    # 逆指値接近
+    # 警戒ライン接近
     previous_stop_near = bool(previous.get("stop_near", False)) if previous else False
     if current["stop_near"] and not previous_stop_near:
-        reasons.append("逆指値まで2%以内")
+        reasons.append("⚠️ 警戒ラインまで2%以内")
 
-    # 逆指値到達
+    # 警戒ラインを場中に割れ
     previous_breached = bool(previous.get("stop_breached", False)) if previous else False
     if current["stop_breached"] and not previous_breached:
-        reasons.append("🚨 逆指値ライン到達・割れ")
+        reasons.append("⚠️ 警戒ライン到達・割れ（即売却ではなく終値確認）")
+
+    # 警戒ラインを確定終値でも割れ
+    previous_warning_close = (
+        bool(previous.get("warning_close_breached", False))
+        if previous
+        else False
+    )
+    if current["warning_close_breached"] and not previous_warning_close:
+        if current["downside_risk"] >= 2:
+            reasons.append(
+                "🚨 警戒ラインを確定終値でも割れ "
+                f"＋下落継続リスク{current['downside_band']}"
+            )
+        else:
+            reasons.append("⚠️ 警戒ラインを確定終値でも割れ（反発確認）")
+
+    # 最終撤退ライン
+    previous_final_exit = (
+        bool(previous.get("final_exit_breached", False))
+        if previous
+        else False
+    )
+    if current["final_exit_breached"] and not previous_final_exit:
+        reasons.append("🚨 最終撤退ライン到達・割れ")
 
     # 20日安値割れ
     previous_breakdown = bool(previous.get("breakdown", False)) if previous else False
@@ -679,6 +741,8 @@ for row in holdings:
         "sudden_drop": current["sudden_drop"],
         "stop_near": current["stop_near"],
         "stop_breached": current["stop_breached"],
+        "warning_close_breached": current["warning_close_breached"],
+        "final_exit_breached": current["final_exit_breached"],
         "breakdown": current["breakdown"],
         "last_price": current["price"],
         "breakout_level": stored_breakout_level,
@@ -708,7 +772,8 @@ if alerts:
         for reason in stock["alert_reasons"]:
             lines.append(f"・{reason}")
 
-        lines.append(f"逆指値 {stock['stop_price']:,.0f}円")
+        lines.append(f"警戒ライン {stock['stop_price']:,.0f}円")
+        lines.append(f"最終撤退ライン {stock['final_exit_price']:,.0f}円")
         lines.append(f"利確① {stock['tp1']:,.0f}円 / 利確② {stock['tp2']:,.0f}円")
         lines.append("")
 
