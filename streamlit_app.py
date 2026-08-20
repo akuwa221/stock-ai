@@ -741,6 +741,31 @@ def analyze_stock(code, saved_breakout_level=None, previous_danger_streak=0):
         downside_risk += 1
         downside_reasons.append("下落日に出来高増")
 
+    # -------------------------------------------------
+    # 検証中の候補配点
+    # 本番の売却判断・逆指値にはまだ使わない
+    # -------------------------------------------------
+    candidate_downside_risk = 0
+
+    if breakdown_confirmed:
+        candidate_downside_risk += 2
+    if ma25_slope_pct < 0:
+        candidate_downside_risk += 1
+    if change_pct <= -2.0:
+        candidate_downside_risk += 1
+    if down_volume:
+        candidate_downside_risk += 2
+
+    # 組み合わせボーナス
+    if breakdown_confirmed and change_pct <= -2.0:
+        candidate_downside_risk += 2
+    if breakdown_confirmed and down_volume:
+        candidate_downside_risk += 2
+    if ma25_slope_pct < 0 and down_volume:
+        candidate_downside_risk += 1
+
+    candidate_downside_label = downside_band_from_score(candidate_downside_risk)
+
     if downside_risk >= 4:
         downside_label = "🔴 高い"
     elif downside_risk >= 2:
@@ -794,6 +819,8 @@ def analyze_stock(code, saved_breakout_level=None, previous_danger_streak=0):
         "downside_risk": downside_risk,
         "downside_label": downside_label,
         "downside_reasons": downside_reasons,
+        "candidate_downside_risk": candidate_downside_risk,
+        "candidate_downside_label": candidate_downside_label,
         "breakdown_confirmed": breakdown_confirmed,
         "ma25_slope_pct": ma25_slope_pct,
         "score": score,
@@ -901,7 +928,7 @@ def get_position_judgment(
 
 
 # =========================================================
-# 3年バックテスト V5
+# 3年バックテスト V6
 # ・旧トレンド判定だけでなく「下落継続リスク」そのものを検証
 # ・同じ状態が続く日を重複カウントせず、状態が変わった初日を1回とする
 # ・5日/20日後の終値、途中の最大下落/上昇、逆指値到達まで確認
@@ -1029,6 +1056,42 @@ def run_signal_backtest(code):
     daily["downside_band"] = daily["downside_risk"].apply(downside_band_from_score)
 
     # -----------------------------------------------------
+    # 候補配点モデル（V6検証用）
+    # 25日線より下は0点、出来高増を重くし、
+    # 安値割れ＋急落/出来高などの組み合わせを加点
+    # -----------------------------------------------------
+    candidate_risk = pd.Series(0, index=daily.index, dtype="int64")
+    candidate_risk += daily["BREAKDOWN"].fillna(False).astype(int) * 2
+    candidate_risk += (daily["MA25_SLOPE"] < 0).fillna(False).astype(int) * 1
+    candidate_risk += (daily["CHANGE_PCT"] <= -2.0).fillna(False).astype(int) * 1
+
+    candidate_down_volume = (
+        (daily["CHANGE_PCT"] < 0)
+        & (daily["VOL_RATIO"] >= 1.30)
+    ).fillna(False)
+    candidate_risk += candidate_down_volume.astype(int) * 2
+
+    candidate_risk += (
+        daily["BREAKDOWN"].fillna(False)
+        & (daily["CHANGE_PCT"] <= -2.0).fillna(False)
+    ).astype(int) * 2
+
+    candidate_risk += (
+        daily["BREAKDOWN"].fillna(False)
+        & candidate_down_volume
+    ).astype(int) * 2
+
+    candidate_risk += (
+        (daily["MA25_SLOPE"] < 0).fillna(False)
+        & candidate_down_volume
+    ).astype(int) * 1
+
+    daily["candidate_downside_risk"] = candidate_risk
+    daily["candidate_downside_band"] = daily["candidate_downside_risk"].apply(
+        downside_band_from_score
+    )
+
+    # -----------------------------------------------------
     # 下落継続リスクを構成する各条件
     # 後で「どの条件が本当に効いているか」を個別検証する
     # -----------------------------------------------------
@@ -1150,6 +1213,8 @@ def run_signal_backtest(code):
             "signal": row["signal"],
             "downside_risk": downside_risk,
             "downside_band": row["downside_band"],
+            "candidate_downside_risk": int(row["candidate_downside_risk"]),
+            "candidate_downside_band": row["candidate_downside_band"],
             "entry": entry_price,
             "ret_5": ret5,
             "ret_20": ret20,
@@ -1202,6 +1267,27 @@ def run_signal_backtest(code):
                 downside_events.append(event)
 
     downside_df = pd.DataFrame(downside_events)
+
+    # -----------------------------------------------------
+    # 候補配点モデルのイベント
+    # 低め→注意→高いなど、候補リスク帯が変わった初日だけ
+    # -----------------------------------------------------
+    daily["candidate_downside_event"] = (
+        indicator_ready
+        & indicator_ready.shift(1).fillna(False).astype(bool)
+        & daily["candidate_downside_band"].ne(
+            daily["candidate_downside_band"].shift(1)
+        )
+    )
+
+    candidate_events = []
+    for pos in range(len(daily)):
+        if bool(daily["candidate_downside_event"].iloc[pos]):
+            event = evaluate_event(pos, "candidate_downside")
+            if event is not None:
+                candidate_events.append(event)
+
+    candidate_df = pd.DataFrame(candidate_events)
 
     # -----------------------------------------------------
     # 各条件が「新しく成立した日」のその後を検証
@@ -1355,6 +1441,33 @@ def run_signal_backtest(code):
             )
 
     # -----------------------------------------------------
+    # 候補配点モデル集計
+    # -----------------------------------------------------
+    candidate_rows = []
+
+    if not candidate_df.empty:
+        for band in downside_order:
+            part = candidate_df[
+                candidate_df["candidate_downside_band"] == band
+            ]
+            if part.empty:
+                continue
+
+            candidate_rows.append(
+                {
+                    "候補リスク": band,
+                    "発生回数": len(part),
+                    "5日後下落率": (part["ret_5"] < 0).mean() * 100,
+                    "20日後下落率": (part["ret_20"] < 0).mean() * 100,
+                    "5日以内-3%": part["drop_3pct_5"].mean() * 100,
+                    "20日以内-5%": part["drop_5pct_20"].mean() * 100,
+                    "5日最大下落": part["max_drop_5"].mean(),
+                    "20日最大下落": part["max_drop_20"].mean(),
+                    "20日最大上昇": part["max_gain_20"].mean(),
+                }
+            )
+
+    # -----------------------------------------------------
     # リスク点数そのものも確認
     # バンド内で2点と3点に差があるか等を見る
     # -----------------------------------------------------
@@ -1458,6 +1571,8 @@ def run_signal_backtest(code):
         "performance": pd.DataFrame(performance_rows),
         "risk": pd.DataFrame(trend_risk_rows),
         "downside": pd.DataFrame(downside_rows),
+        "candidate_downside": pd.DataFrame(candidate_rows),
+        "candidate_events": candidate_df,
         "downside_scores": pd.DataFrame(score_rows),
         "condition_effects": pd.DataFrame(condition_rows),
         "condition_combinations": pd.DataFrame(combination_rows),
@@ -1477,7 +1592,7 @@ def run_signal_backtest(code):
     }
 
 
-def render_backtest(code, row_id, current_status, current_downside_risk):
+def render_backtest(code, row_id, current_status, current_downside_risk, current_candidate_risk):
     session_key = f"backtest_open_{row_id}"
 
     with st.expander("🧪 この判定を過去3年で検証"):
@@ -1505,6 +1620,7 @@ def render_backtest(code, row_id, current_status, current_downside_risk):
                 result = run_signal_backtest(code)
 
             downside = result["downside"]
+            candidate_downside = result["candidate_downside"]
             downside_scores = result["downside_scores"]
             performance = result["performance"]
             trend_risk = result["risk"]
@@ -1631,6 +1747,85 @@ def render_backtest(code, row_id, current_status, current_downside_risk):
                     show_scores[col] = show_scores[col].map(lambda x: f"{x:.1f}%")
 
             st.dataframe(show_scores, use_container_width=True, hide_index=True)
+
+            # =================================================
+            # 候補配点モデルを再検証
+            # =================================================
+            st.markdown("### 🧪 候補配点モデルの再検証")
+            st.caption(
+                "本番判定はまだ変更していません。"
+                "25日線より下を0点、出来高増を2点にし、"
+                "安値割れ＋急落/出来高などの組み合わせを追加した候補モデルです。"
+            )
+
+            candidate_band = downside_band_from_score(current_candidate_risk)
+            st.markdown(
+                f"#### 現在を候補配点で見ると：{candidate_band} "
+                f"（スコア {int(current_candidate_risk)}）"
+            )
+
+            if candidate_downside.empty:
+                st.info("候補配点モデルのイベントを十分に取得できませんでした。")
+            else:
+                show_candidate = candidate_downside.copy()
+                for col in [
+                    "5日後下落率",
+                    "20日後下落率",
+                    "5日以内-3%",
+                    "20日以内-5%",
+                    "5日最大下落",
+                    "20日最大下落",
+                    "20日最大上昇",
+                ]:
+                    if col in show_candidate.columns:
+                        show_candidate[col] = show_candidate[col].map(
+                            lambda x: f"{x:.1f}%"
+                        )
+
+                st.dataframe(
+                    show_candidate,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                low_c = candidate_downside[
+                    candidate_downside["候補リスク"] == "🟢 低め"
+                ]
+                high_c = candidate_downside[
+                    candidate_downside["候補リスク"] == "🔴 高い"
+                ]
+
+                if not low_c.empty and not high_c.empty:
+                    low = low_c.iloc[0]
+                    high = high_c.iloc[0]
+                    crash_gap = (
+                        float(high["20日以内-5%"])
+                        - float(low["20日以内-5%"])
+                    )
+                    draw_gap = (
+                        float(high["20日最大下落"])
+                        - float(low["20日最大下落"])
+                    )
+                    high_n = int(high["発生回数"])
+
+                    if high_n >= 10 and crash_gap >= 20 and draw_gap >= 1.0:
+                        st.success(
+                            "✅ 候補配点はかなり有望です。"
+                            f"高リスクは低リスクより20日以内-5%が "
+                            f"{crash_gap:+.1f}pt高く、最大下落も "
+                            f"{draw_gap:+.1f}pt大きくなっています。"
+                        )
+                    elif crash_gap > 0 or draw_gap > 0:
+                        st.warning(
+                            "⚠️ 候補配点は改善傾向がありますが、"
+                            f"高リスクの発生回数は {high_n}回です。"
+                            "サンプル数と差を見てから本番反映を判断します。"
+                        )
+                    else:
+                        st.error(
+                            "❌ 候補配点では高リスクほど悪化する形が出ていません。"
+                            "この配点は本番には反映しない方がよい結果です。"
+                        )
 
             # =================================================
             # 条件ごとの効き方
@@ -2372,6 +2567,7 @@ for item in items:
         row_id=row_id,
         current_status=a["status"],
         current_downside_risk=a["downside_risk"],
+        current_candidate_risk=a["candidate_downside_risk"],
     )
 
     # -----------------------------------------------------
