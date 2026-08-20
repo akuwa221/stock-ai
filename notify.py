@@ -275,18 +275,18 @@ def get_round_level_state(price, daily, intraday, market_open, saved_breakout_le
 # 逆指値プロファイル
 # =========================================================
 
-def get_stop_profile(risk_rank, danger_streak):
-    if risk_rank == 4:
-        return 1.50, 0.030, "強い上昇"
-    if risk_rank == 3:
-        return 1.35, 0.028, "上昇"
-    if risk_rank == 2:
-        return 1.20, 0.025, "様子見"
-    if risk_rank == 1:
-        return 1.00, 0.020, "注意"
-    if danger_streak < 2:
-        return 1.00, 0.020, "危険1回目・強い引き締め保留"
-    return 0.80, 0.016, "危険2回連続以上"
+def get_stop_profile(downside_risk):
+    # 単なる弱いトレンドでは逆指値を強く締めない。
+    # 安値割れ・25日線下降・急落・下落出来高の重なりで調整する。
+    if downside_risk <= 0:
+        return 1.50, 0.030, "下落継続リスク低"
+    if downside_risk == 1:
+        return 1.40, 0.028, "下落継続リスクやや低"
+    if downside_risk == 2:
+        return 1.30, 0.026, "下落継続リスク注意"
+    if downside_risk == 3:
+        return 1.20, 0.024, "下落継続リスク高め"
+    return 1.00, 0.020, "下落継続リスク高"
 
 
 # =========================================================
@@ -436,19 +436,37 @@ def check_stock(row, previous_state=None):
     previous_danger_streak = max(clean_int(previous_state.get("danger_streak", 0), 0), 0)
     danger_streak = previous_danger_streak + 1 if risk_rank == 0 else 0
 
+    # 下落継続リスクを別計算
+    ma25_series = closes.rolling(25).mean()
+    ma25_5days_ago = float(ma25_series.iloc[-6]) if len(ma25_series) >= 6 else ma25
+    ma25_slope_pct = (ma25 / ma25_5days_ago - 1) * 100 if ma25_5days_ago else 0.0
+    breakdown_confirmed = price < prior_20_low * 0.995
+    down_volume = change_pct < 0 and volume_ratio >= 1.30
+
+    downside_risk = 0
+    if breakdown_confirmed:
+        downside_risk += 2
+    if price < ma25:
+        downside_risk += 1
+    if ma25_slope_pct < 0:
+        downside_risk += 1
+    if change_pct <= -2.0:
+        downside_risk += 1
+    if down_volume:
+        downside_risk += 1
+
     stop_support = prior_20_low * 0.995
     base_stop = min(stop_support, price - atr14 * 1.5)
 
     atr_multiplier, minimum_gap_pct, stop_profile_text = get_stop_profile(
-        risk_rank,
-        danger_streak,
+        downside_risk
     )
 
     defensive_atr_stop = price - atr14 * atr_multiplier
     minimum_gap_stop = price * (1 - minimum_gap_pct)
     defensive_stop = min(defensive_atr_stop, minimum_gap_stop)
 
-    stop_candidate = base_stop if risk_rank == 4 else max(base_stop, defensive_stop)
+    stop_candidate = base_stop if downside_risk <= 0 else max(base_stop, defensive_stop)
     stop_candidate = min(stop_candidate, price * 0.995)
     stop_candidate = float(round(stop_candidate))
 
@@ -496,6 +514,9 @@ def check_stock(row, previous_state=None):
         "risk_rank": risk_rank,
         "status": status,
         "danger_streak": danger_streak,
+        "downside_risk": downside_risk,
+        "breakdown_confirmed": breakdown_confirmed,
+        "ma25_slope_pct": ma25_slope_pct,
         "stop_profile_text": stop_profile_text,
         "prior_20_low": prior_20_low,
         "stop_price": active_stop,
@@ -552,11 +573,6 @@ for row in holdings:
         if current["risk_rank"] < previous_rank:
             reasons.append(f"判定悪化 → {current['status']}")
 
-    # 危険が2回連続になった瞬間
-    previous_danger_streak = clean_int(previous.get("danger_streak", 0), 0)
-    if current["danger_streak"] >= 2 and previous_danger_streak < 2:
-        reasons.append("🔴 危険判定が2回連続 → 逆指値を本格的に引き締め")
-
     # 急落
     previous_drop = bool(previous.get("sudden_drop", False)) if previous else False
     if current["sudden_drop"] and not previous_drop:
@@ -575,7 +591,7 @@ for row in holdings:
     # 20日安値割れ
     previous_breakdown = bool(previous.get("breakdown", False)) if previous else False
     if current["breakdown"] and not previous_breakdown:
-        reasons.append("20日安値を割りました")
+        reasons.append("🚨 20日安値を割りました。下落継続リスクを確認")
 
     # 正式突破
     previous_breakout_level = clean_float(previous.get("breakout_level")) if previous else None

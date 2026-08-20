@@ -486,21 +486,18 @@ def get_round_level_state(price, daily, intraday, market_open, saved_breakout_le
 # 危険1回目は「注意」相当で様子見、2回連続で危険なら危険用へ
 # =========================================================
 
-def get_stop_profile(risk_rank, danger_streak):
-    if risk_rank == 4:
-        return 1.50, 0.030, "強い上昇"
-    if risk_rank == 3:
-        return 1.35, 0.028, "上昇"
-    if risk_rank == 2:
-        return 1.20, 0.025, "様子見"
-    if risk_rank == 1:
-        return 1.00, 0.020, "注意"
-
-    # 危険1回目は急激に締めない
-    if danger_streak < 2:
-        return 1.00, 0.020, "危険1回目・強い引き締め保留"
-
-    return 0.80, 0.016, "危険2回連続以上"
+def get_stop_profile(downside_risk):
+    # バックテスト上、単なる「弱いトレンド」は反発が多かったため、
+    # 逆指値はトレンド点数ではなく「下落継続リスク」で締める。
+    if downside_risk <= 0:
+        return 1.50, 0.030, "下落継続リスク低"
+    if downside_risk == 1:
+        return 1.40, 0.028, "下落継続リスクやや低"
+    if downside_risk == 2:
+        return 1.30, 0.026, "下落継続リスク注意"
+    if downside_risk == 3:
+        return 1.20, 0.024, "下落継続リスク高め"
+    return 1.00, 0.020, "下落継続リスク高"
 
 
 # =========================================================
@@ -716,19 +713,53 @@ def analyze_stock(code, saved_breakout_level=None, previous_danger_streak=0):
     previous_danger_streak = max(clean_int(previous_danger_streak, 0), 0)
     danger_streak = previous_danger_streak + 1 if risk_rank == 0 else 0
 
+    # =====================================================
+    # 下落継続リスク
+    # 「今まで弱かった」ことと「これからさらに下がる」を分離する
+    # =====================================================
+    ma25_5days_ago = float(daily["MA25"].iloc[-6]) if len(daily) >= 6 else ma25
+    ma25_slope_pct = (ma25 / ma25_5days_ago - 1) * 100 if ma25_5days_ago else 0.0
+    breakdown_confirmed = latest_price < prior_20_low * 0.995
+    down_volume = change_pct < 0 and volume_ratio >= 1.30
+
+    downside_risk = 0
+    downside_reasons = []
+
+    if breakdown_confirmed:
+        downside_risk += 2
+        downside_reasons.append("20日安値を0.5%以上割り込み")
+    if latest_price < ma25:
+        downside_risk += 1
+        downside_reasons.append("株価が25日線より下")
+    if ma25_slope_pct < 0:
+        downside_risk += 1
+        downside_reasons.append("25日線が下降中")
+    if change_pct <= -2.0:
+        downside_risk += 1
+        downside_reasons.append("前日比-2%以上")
+    if down_volume:
+        downside_risk += 1
+        downside_reasons.append("下落日に出来高増")
+
+    if downside_risk >= 4:
+        downside_label = "🔴 高い"
+    elif downside_risk >= 2:
+        downside_label = "🟠 注意"
+    else:
+        downside_label = "🟢 低め"
+
     stop_support = prior_20_low * 0.995
     base_stop = min(stop_support, latest_price - atr14 * 1.5)
 
     atr_multiplier, minimum_gap_pct, stop_profile_text = get_stop_profile(
-        risk_rank,
-        danger_streak,
+        downside_risk
     )
 
     defensive_atr_stop = latest_price - atr14 * atr_multiplier
     minimum_gap_stop = latest_price * (1 - minimum_gap_pct)
     defensive_stop = min(defensive_atr_stop, minimum_gap_stop)
 
-    if risk_rank == 4:
+    if downside_risk <= 0:
         stop_candidate = base_stop
     else:
         stop_candidate = max(base_stop, defensive_stop)
@@ -760,6 +791,11 @@ def analyze_stock(code, saved_breakout_level=None, previous_danger_streak=0):
         "minimum_gap_pct": minimum_gap_pct,
         "stop_profile_text": stop_profile_text,
         "danger_streak": danger_streak,
+        "downside_risk": downside_risk,
+        "downside_label": downside_label,
+        "downside_reasons": downside_reasons,
+        "breakdown_confirmed": breakdown_confirmed,
+        "ma25_slope_pct": ma25_slope_pct,
         "score": score,
         "status": status,
         "level": level,
@@ -818,20 +854,50 @@ def get_take_profit_lines(buy_price, initial_stop, atr14):
 # 保有・売却判断
 # =========================================================
 
-def get_position_judgment(price, buy_price, score, active_stop, stop_gap_pct, tp1, tp2):
+def get_position_judgment(
+    price,
+    buy_price,
+    score,
+    active_stop,
+    stop_gap_pct,
+    tp1,
+    tp2,
+    downside_risk,
+    breakdown_confirmed,
+):
     if price <= active_stop:
         return "🔴 売却・損切りを検討", "現在値が逆指値ラインに到達または割れています。"
+
     if price >= tp2:
         return "🎯 利確②到達", "2Rの利確目安に到達。残りの利確や逆指値引き上げを検討する水準です。"
+
     if price >= tp1:
         return "🟢 一部利確を検討", "1.5Rの利確目安に到達しています。"
+
+    # 単なる弱いトレンドだけでは売却にしない。
+    # 20日安値割れ・25日線下降・急落・下落出来高などが重なる時だけ強く警戒。
+    if downside_risk >= 4 and breakdown_confirmed:
+        return (
+            "🔴 売却・一部撤退を検討",
+            "弱いトレンドだけでなく、安値割れなど下落継続の条件が複数重なっています。",
+        )
+
+    if downside_risk >= 2 or stop_gap_pct <= 2:
+        return (
+            "🟠 保有継続・強く警戒",
+            "下落継続リスクが上がっています。逆指値と安値割れを優先して確認します。",
+        )
+
     if score <= -3:
-        return "🔴 売却・損切りを検討", "短中期トレンドが弱く、下落警戒を優先する状態です。"
-    if score <= -1 or stop_gap_pct <= 2:
-        return "🟠 保有継続・強く警戒", "トレンド悪化または逆指値接近のため、防御を優先する状態です。"
+        return (
+            "🟡 トレンド弱い・反発確認",
+            "現在のトレンドは弱いですが、過去検証ではこの状態だけでは売却根拠になりにくいため、反発か安値割れを確認します。",
+        )
+
     if price < buy_price and score <= 0:
         return "🟡 保有継続・警戒", "買値を下回っているため、上昇確認までは警戒が必要です。"
-    return "🟢 保有継続", "現時点では保有継続を優先できるテクニカル状態です。"
+
+    return "🟢 保有継続", "現時点では保有継続を優先できる状態です。"
 
 
 # =========================================================
@@ -935,7 +1001,19 @@ def run_signal_backtest(code):
     daily["signal"] = daily["score"].apply(classify)
     daily["risk_rank"] = daily["score"].apply(risk_rank_from_score)
 
-    indicator_ready = daily[["MA75", "LOW20", "PRIOR_LOW20", "ATR14"]].notna().all(axis=1)
+    daily["MA25_SLOPE"] = (daily["MA25"] / daily["MA25"].shift(5) - 1) * 100
+    daily["CHANGE_PCT"] = daily["Close"].pct_change() * 100
+    daily["VOL_RATIO"] = daily["Volume"] / daily["VOL20"].replace(0, pd.NA)
+    daily["BREAKDOWN"] = daily["Close"] < daily["PRIOR_LOW20"] * 0.995
+
+    daily["downside_risk"] = 0
+    daily.loc[daily["BREAKDOWN"], "downside_risk"] += 2
+    daily.loc[daily["Close"] < daily["MA25"], "downside_risk"] += 1
+    daily.loc[daily["MA25_SLOPE"] < 0, "downside_risk"] += 1
+    daily.loc[daily["CHANGE_PCT"] <= -2.0, "downside_risk"] += 1
+    daily.loc[(daily["CHANGE_PCT"] < 0) & (daily["VOL_RATIO"] >= 1.30), "downside_risk"] += 1
+
+    indicator_ready = daily[["MA75", "LOW20", "PRIOR_LOW20", "ATR14", "MA25_SLOPE"]].notna().all(axis=1)
 
     # -----------------------------------------------------
     # 重要：同じ判定が続く日を何回も数えない
@@ -993,7 +1071,7 @@ def run_signal_backtest(code):
         # 危険シグナル初日は danger_streak=1 として扱う
         # -------------------------------------------------
         rank = int(row["risk_rank"])
-        danger_streak = 1 if rank == 0 else 0
+        downside_risk = int(row["downside_risk"])
         atr14 = float(row["ATR14"])
         prior_20_low = float(row["PRIOR_LOW20"])
 
@@ -1001,15 +1079,14 @@ def run_signal_backtest(code):
         base_stop = min(stop_support, entry_price - atr14 * 1.5)
 
         atr_multiplier, minimum_gap_pct, _ = get_stop_profile(
-            rank,
-            danger_streak,
+            downside_risk
         )
 
         defensive_atr_stop = entry_price - atr14 * atr_multiplier
         minimum_gap_stop = entry_price * (1 - minimum_gap_pct)
         defensive_stop = min(defensive_atr_stop, minimum_gap_stop)
 
-        if rank == 4:
+        if downside_risk <= 0:
             stop_price = base_stop
         else:
             stop_price = max(base_stop, defensive_stop)
@@ -1044,6 +1121,7 @@ def run_signal_backtest(code):
             {
                 "date": daily.index[pos],
                 "signal": row["signal"],
+                "downside_risk": downside_risk,
                 "entry": entry_price,
                 "ret_5": ret5,
                 "ret_20": ret20,
@@ -1480,6 +1558,8 @@ with st.spinner("保有株を分析しています..."):
                 stop_gap_pct,
                 tp1,
                 tp2,
+                analysis["downside_risk"],
+                analysis["breakdown_confirmed"],
             )
 
             route = build_price_route(
@@ -1711,18 +1791,29 @@ for item in items:
             f"現在値まで： **{gap_yen:,.0f}円 （{gap_pct:.2f}%）**"
         )
 
-    if a["risk_rank"] == 0 and a["danger_streak"] < 2:
-        st.warning(
-            "🔴 危険判定は現在1回目として扱っています。\n\n"
-            "一時的なノイズで逆指値を締めすぎないよう、"
-            "強い引き締めは次回も危険だった場合に行います。"
-        )
-    else:
-        st.caption(
-            f"現在の逆指値設定：{a['stop_profile_text']} "
-            f"（ATR × {a['stop_atr_multiplier']:.2f}）"
-        )
+    st.caption(
+        f"現在の逆指値設定：{a['stop_profile_text']} "
+        f"（ATR × {a['stop_atr_multiplier']:.2f}）"
+    )
 
+    st.markdown("#### 🚨 下落継続リスク")
+    if a["downside_risk"] >= 4:
+        st.error(f"{a['downside_label']}  （スコア {a['downside_risk']}）")
+    elif a["downside_risk"] >= 2:
+        st.warning(f"{a['downside_label']}  （スコア {a['downside_risk']}）")
+    else:
+        st.success(f"{a['downside_label']}  （スコア {a['downside_risk']}）")
+
+    if a["downside_reasons"]:
+        for reason in a["downside_reasons"]:
+            st.caption(f"・{reason}")
+    else:
+        st.caption("安値割れ・25日線下降・急落出来高などの下落継続条件は目立っていません。")
+
+    st.caption(
+        "テクニカルの『危険』は現在のトレンドの弱さを表します。"
+        "売却判断と逆指値の引き締めは、この下落継続リスクを優先します。"
+    )
     st.caption("一度引き上げた逆指値は、判定が改善しても自動では下がりません。")
 
     # -----------------------------------------------------
@@ -1897,7 +1988,9 @@ for item in items:
         st.write(f"通常の広め候補： **{a['base_stop_candidate']:,.0f}円**")
         st.write(f"現在判定を反映した候補： **{a['stop_candidate']:,.0f}円**")
         st.write(f"現在ATR倍率： **{a['stop_atr_multiplier']:.2f}倍**")
-        st.write(f"危険判定連続回数： **{a['danger_streak']}回**")
+        st.write(f"下落継続リスク： **{a['downside_label']} / {a['downside_risk']}点**")
+        st.write(f"25日線5日傾き： **{a['ma25_slope_pct']:+.2f}%**")
+        st.write(f"20日安値明確割れ： **{'はい' if a['breakdown_confirmed'] else 'いいえ'}**")
         st.write(f"初期リスク： **{item['risk_per_share']:,.0f}円/株**")
 
         if a["stop_candidate"] < active_stop:
