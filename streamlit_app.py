@@ -20,6 +20,11 @@ from supabase import create_client
 st.set_page_config(page_title="株AI", page_icon="📈", layout="centered")
 st.title("📈 株AI")
 
+# ページ上部の手動更新ボタン
+if st.button("🔄 最新情報に更新", use_container_width=True, key="refresh_top"):
+    st.cache_data.clear()
+    st.rerun()
+
 JST = ZoneInfo("Asia/Tokyo")
 JPX_URL = (
     "https://www.jpx.co.jp/markets/statistics-equities/"
@@ -1495,7 +1500,7 @@ if st.button("保存する", type="primary"):
 # =========================================================
 
 st.divider()
-if st.button("🔄 最新情報に更新", use_container_width=True):
+if st.button("🔄 最新情報に更新", use_container_width=True, key="refresh_bottom"):
     st.cache_data.clear()
     st.rerun()
 
