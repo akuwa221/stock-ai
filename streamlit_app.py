@@ -20,6 +20,13 @@ from supabase import create_client
 st.set_page_config(page_title="株AI", page_icon="📈", layout="centered")
 st.title("📈 株AI")
 
+# =========================================================
+# 上部の手動更新
+# =========================================================
+if st.button("🔄 最新情報に更新", key="top_refresh", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun()
+
 JST = ZoneInfo("Asia/Tokyo")
 JPX_URL = (
     "https://www.jpx.co.jp/markets/statistics-equities/"
@@ -828,6 +835,173 @@ def get_position_judgment(price, buy_price, score, active_stop, stop_gap_pct, tp
 
 
 # =========================================================
+# 3年バックテスト
+# =========================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def run_signal_backtest(code):
+    ticker_code = normalize_ticker(code)
+
+    try:
+        daily = retry_history(ticker_code, period="3y", interval="1d", attempts=3)
+    except Exception:
+        daily = yf.download(
+            ticker_code,
+            period="3y",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+
+    if daily.empty:
+        raise ValueError("バックテスト用の株価データを取得できませんでした。")
+
+    if isinstance(daily.columns, pd.MultiIndex):
+        try:
+            daily = daily.xs(ticker_code, axis=1, level=-1, drop_level=True)
+        except Exception:
+            daily.columns = daily.columns.get_level_values(0)
+
+    daily = daily.copy()
+    daily.index = to_jst_naive(daily.index)
+    daily = daily.dropna(subset=["High", "Low", "Close"])
+
+    if "Volume" not in daily.columns:
+        daily["Volume"] = 0
+
+    if len(daily) < 120:
+        raise ValueError("バックテスト用データが不足しています。")
+
+    daily["MA5"] = daily["Close"].rolling(5).mean()
+    daily["MA25"] = daily["Close"].rolling(25).mean()
+    daily["MA75"] = daily["Close"].rolling(75).mean()
+    daily["LOW20"] = daily["Low"].rolling(20).min()
+    daily["VOL20"] = daily["Volume"].rolling(20).mean()
+
+    score = pd.Series(0.0, index=daily.index)
+    score += daily["Close"].gt(daily["MA5"]).map({True: 1, False: -1})
+    score += daily["MA5"].gt(daily["MA25"]).map({True: 1, False: -1})
+    score += daily["Close"].gt(daily["MA25"]).map({True: 1, False: -1})
+    score += daily["MA25"].gt(daily["MA75"]).map({True: 1, False: -1})
+
+    low_distance = (daily["Close"] - daily["LOW20"]) / daily["Close"] * 100
+    score += low_distance.le(2).astype(int) * -2
+
+    volume_ratio = daily["Volume"] / daily["VOL20"].replace(0, pd.NA)
+    score += volume_ratio.ge(1.5).fillna(False).astype(int)
+    daily["score"] = score
+
+    def classify(value):
+        if value >= 4:
+            return "🟢 強い上昇"
+        if value >= 2:
+            return "🟢 上昇"
+        if value >= 0:
+            return "🟡 様子見"
+        if value >= -2:
+            return "🟠 注意"
+        return "🔴 危険"
+
+    daily["signal"] = daily["score"].apply(classify)
+    daily["ret_5"] = (daily["Close"].shift(-5) / daily["Close"] - 1) * 100
+    daily["ret_20"] = (daily["Close"].shift(-20) / daily["Close"] - 1) * 100
+
+    valid = daily.dropna(subset=["MA75", "LOW20", "ret_5", "ret_20"]).copy()
+    if valid.empty:
+        raise ValueError("バックテスト可能な期間がありません。")
+
+    order = ["🟢 強い上昇", "🟢 上昇", "🟡 様子見", "🟠 注意", "🔴 危険"]
+    rows = []
+    for signal in order:
+        part = valid[valid["signal"] == signal]
+        if part.empty:
+            continue
+        rows.append({
+            "判定": signal,
+            "回数": len(part),
+            "5日後上昇率": (part["ret_5"] > 0).mean() * 100,
+            "5日後平均": part["ret_5"].mean(),
+            "20日後上昇率": (part["ret_20"] > 0).mean() * 100,
+            "20日後平均": part["ret_20"].mean(),
+        })
+
+    return {
+        "summary": pd.DataFrame(rows),
+        "overall_up5": (valid["ret_5"] > 0).mean() * 100,
+        "overall_up20": (valid["ret_20"] > 0).mean() * 100,
+        "samples": len(valid),
+        "start": valid.index.min(),
+        "end": valid.index.max(),
+    }
+
+
+def render_backtest(code, row_id, current_status):
+    session_key = f"backtest_open_{row_id}"
+
+    with st.expander("🧪 この判定を過去3年で検証"):
+        st.caption(
+            "移動平均・20日安値・出来高を使う現在の基本スコアを、"
+            "過去約3年の日足で検証します。"
+        )
+
+        if st.button(
+            "▶ 3年バックテストを実行",
+            key=f"run_backtest_{row_id}",
+            use_container_width=True,
+        ):
+            st.session_state[session_key] = True
+
+        if not st.session_state.get(session_key, False):
+            st.info("上のボタンを押すと結果を表示します。")
+            return
+
+        try:
+            with st.spinner("過去3年を検証しています..."):
+                result = run_signal_backtest(code)
+
+            summary = result["summary"]
+            st.write(
+                f"検証期間： **{result['start'].date()} ～ {result['end'].date()}** "
+                f"（{result['samples']:,}営業日）"
+            )
+
+            current = summary[summary["判定"] == current_status]
+            if not current.empty:
+                r = current.iloc[0]
+                if current_status in ["🔴 危険", "🟠 注意"]:
+                    down5 = 100 - float(r["5日後上昇率"])
+                    down20 = 100 - float(r["20日後上昇率"])
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.metric("5日後に下落", f"{down5:.1f}%")
+                    with c2:
+                        st.metric("20日後に下落", f"{down20:.1f}%")
+                    normal_down5 = 100 - result["overall_up5"]
+                    st.caption(f"全期間の5日後下落率は {normal_down5:.1f}% です。")
+                else:
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.metric("5日後に上昇", f"{float(r['5日後上昇率']):.1f}%")
+                    with c2:
+                        st.metric("20日後に上昇", f"{float(r['20日後上昇率']):.1f}%")
+                    st.caption(f"全期間の5日後上昇率は {result['overall_up5']:.1f}% です。")
+
+            show = summary.copy()
+            for col in ["5日後上昇率", "5日後平均", "20日後上昇率", "20日後平均"]:
+                show[col] = show[col].map(lambda x: f"{x:.1f}%")
+
+            st.dataframe(show, use_container_width=True, hide_index=True)
+            st.caption(
+                "※場中の節目突破、ニュース、決算、地合い、買値、"
+                "保存済み逆指値まではこのバックテストに含めていません。"
+            )
+
+        except Exception as e:
+            st.error(f"バックテストエラー：{e}")
+
+
+# =========================================================
 # 上値ルート
 # =========================================================
 
@@ -1396,6 +1570,15 @@ for item in items:
         st.error(a["status"])
 
     # -----------------------------------------------------
+    # 3年バックテスト
+    # -----------------------------------------------------
+    render_backtest(
+        code=code,
+        row_id=row_id,
+        current_status=a["status"],
+    )
+
+    # -----------------------------------------------------
     # ニュース
     # -----------------------------------------------------
     with st.expander("📰 関連ニュース"):
@@ -1495,7 +1678,7 @@ if st.button("保存する", type="primary"):
 # =========================================================
 
 st.divider()
-if st.button("🔄 最新情報に更新", use_container_width=True):
+if st.button("🔄 最新情報に更新", key="bottom_refresh", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
 
