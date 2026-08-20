@@ -901,7 +901,7 @@ def get_position_judgment(
 
 
 # =========================================================
-# 3年バックテスト V4
+# 3年バックテスト V5
 # ・旧トレンド判定だけでなく「下落継続リスク」そのものを検証
 # ・同じ状態が続く日を重複カウントせず、状態が変わった初日を1回とする
 # ・5日/20日後の終値、途中の最大下落/上昇、逆指値到達まで確認
@@ -1028,6 +1028,18 @@ def run_signal_backtest(code):
 
     daily["downside_band"] = daily["downside_risk"].apply(downside_band_from_score)
 
+    # -----------------------------------------------------
+    # 下落継続リスクを構成する各条件
+    # 後で「どの条件が本当に効いているか」を個別検証する
+    # -----------------------------------------------------
+    daily["COND_BREAKDOWN"] = daily["BREAKDOWN"].fillna(False).astype(bool)
+    daily["COND_BELOW_MA25"] = (daily["Close"] < daily["MA25"]).fillna(False).astype(bool)
+    daily["COND_MA25_DOWN"] = (daily["MA25_SLOPE"] < 0).fillna(False).astype(bool)
+    daily["COND_DROP_2"] = (daily["CHANGE_PCT"] <= -2.0).fillna(False).astype(bool)
+    daily["COND_DOWN_VOLUME"] = (
+        (daily["CHANGE_PCT"] < 0) & (daily["VOL_RATIO"] >= 1.30)
+    ).fillna(False).astype(bool)
+
     indicator_ready = daily[
         ["MA75", "LOW20", "PRIOR_LOW20", "ATR14", "MA25_SLOPE"]
     ].notna().all(axis=1)
@@ -1037,6 +1049,16 @@ def run_signal_backtest(code):
     # -----------------------------------------------------
     daily["ret_5"] = (daily["Close"].shift(-5) / daily["Close"] - 1) * 100
     daily["ret_20"] = (daily["Close"].shift(-20) / daily["Close"] - 1) * 100
+
+    # 全営業日ベースの「20日以内にどれだけ下げたか」も計算
+    future20_lows = pd.concat(
+        [daily["Low"].shift(-i) for i in range(1, 21)],
+        axis=1,
+    )
+    daily["BASE_MAX_DROP_20"] = (
+        1 - future20_lows.min(axis=1) / daily["Close"]
+    ).clip(lower=0) * 100
+    daily["BASE_DROP_5PCT_20"] = daily["BASE_MAX_DROP_20"] >= 5.0
 
     baseline = daily[
         indicator_ready
@@ -1181,6 +1203,63 @@ def run_signal_backtest(code):
 
     downside_df = pd.DataFrame(downside_events)
 
+    # -----------------------------------------------------
+    # 各条件が「新しく成立した日」のその後を検証
+    # 同じ条件が何日も続いても1回として扱う
+    # -----------------------------------------------------
+    condition_specs = [
+        ("20日安値を0.5%以上割り込み", 2, "COND_BREAKDOWN"),
+        ("株価が25日線より下", 1, "COND_BELOW_MA25"),
+        ("25日線が下降中", 1, "COND_MA25_DOWN"),
+        ("前日比-2%以上", 1, "COND_DROP_2"),
+        ("下落日に出来高増", 1, "COND_DOWN_VOLUME"),
+    ]
+
+    condition_events = []
+    for condition_name, current_weight, col in condition_specs:
+        condition_event_mask = (
+            indicator_ready
+            & daily[col]
+            & ~daily[col].shift(1).fillna(False).astype(bool)
+        )
+
+        for pos in range(len(daily)):
+            if bool(condition_event_mask.iloc[pos]):
+                event = evaluate_event(pos, "condition")
+                if event is not None:
+                    event["condition_name"] = condition_name
+                    event["current_weight"] = current_weight
+                    condition_events.append(event)
+
+    condition_df = pd.DataFrame(condition_events)
+
+    # -----------------------------------------------------
+    # 条件2つの組み合わせも検証
+    # 例：25日線下降 ＋ 20日安値割れ
+    # -----------------------------------------------------
+    combination_events = []
+    for i in range(len(condition_specs)):
+        name1, weight1, col1 = condition_specs[i]
+        for j in range(i + 1, len(condition_specs)):
+            name2, weight2, col2 = condition_specs[j]
+            combo_active = daily[col1] & daily[col2]
+            combo_event_mask = (
+                indicator_ready
+                & combo_active
+                & ~combo_active.shift(1).fillna(False).astype(bool)
+            )
+
+            combo_name = f"{name1} ＋ {name2}"
+            for pos in range(len(daily)):
+                if bool(combo_event_mask.iloc[pos]):
+                    event = evaluate_event(pos, "combination")
+                    if event is not None:
+                        event["combination_name"] = combo_name
+                        event["current_weight_sum"] = weight1 + weight2
+                        combination_events.append(event)
+
+    combination_df = pd.DataFrame(combination_events)
+
     if trend_df.empty and downside_df.empty:
         raise ValueError("判定変化のシグナルを十分に取得できませんでした。")
 
@@ -1298,11 +1377,92 @@ def run_signal_backtest(code):
                 }
             )
 
+    # -----------------------------------------------------
+    # 条件ごとの実績
+    # -----------------------------------------------------
+    baseline_drop5_20 = baseline["BASE_DROP_5PCT_20"].mean() * 100
+    baseline_max_drop_20 = baseline["BASE_MAX_DROP_20"].mean()
+
+    condition_rows = []
+    if not condition_df.empty:
+        for condition_name, current_weight, _ in condition_specs:
+            part = condition_df[condition_df["condition_name"] == condition_name]
+            if part.empty:
+                continue
+
+            crash_rate = part["drop_5pct_20"].mean() * 100
+            avg_max_drop = part["max_drop_20"].mean()
+            crash_gap = crash_rate - baseline_drop5_20
+            draw_gap = avg_max_drop - baseline_max_drop_20
+            n = len(part)
+
+            # 配点候補は自動適用せず、検討材料としてだけ表示する
+            if n < 5:
+                suggested = "保留"
+                strength = "サンプル少"
+            elif crash_gap >= 20 or draw_gap >= 2.0:
+                suggested = 2
+                strength = "強い"
+            elif crash_gap >= 8 or draw_gap >= 1.0:
+                suggested = 1
+                strength = "有効"
+            elif crash_gap <= -8 and draw_gap <= 0:
+                suggested = 0
+                strength = "弱い/逆効果"
+            else:
+                suggested = 1
+                strength = "差小"
+
+            condition_rows.append(
+                {
+                    "条件": condition_name,
+                    "現在配点": current_weight,
+                    "発生回数": n,
+                    "5日後下落率": (part["ret_5"] < 0).mean() * 100,
+                    "20日後下落率": (part["ret_20"] < 0).mean() * 100,
+                    "20日以内-5%": crash_rate,
+                    "基準との差": crash_gap,
+                    "20日最大下落": avg_max_drop,
+                    "20日最大上昇": part["max_gain_20"].mean(),
+                    "効き方": strength,
+                    "配点候補": suggested,
+                }
+            )
+
+    combination_rows = []
+    if not combination_df.empty:
+        for combo_name in combination_df["combination_name"].unique():
+            part = combination_df[combination_df["combination_name"] == combo_name]
+            if len(part) < 3:
+                continue
+
+            crash_rate = part["drop_5pct_20"].mean() * 100
+            combination_rows.append(
+                {
+                    "条件の組み合わせ": combo_name,
+                    "発生回数": len(part),
+                    "5日後下落率": (part["ret_5"] < 0).mean() * 100,
+                    "20日以内-5%": crash_rate,
+                    "基準との差": crash_rate - baseline_drop5_20,
+                    "20日最大下落": part["max_drop_20"].mean(),
+                    "20日最大上昇": part["max_gain_20"].mean(),
+                }
+            )
+
+    combination_rows.sort(
+        key=lambda x: (x["20日以内-5%"], x["発生回数"]),
+        reverse=True,
+    )
+
     return {
         "performance": pd.DataFrame(performance_rows),
         "risk": pd.DataFrame(trend_risk_rows),
         "downside": pd.DataFrame(downside_rows),
         "downside_scores": pd.DataFrame(score_rows),
+        "condition_effects": pd.DataFrame(condition_rows),
+        "condition_combinations": pd.DataFrame(combination_rows),
+        "baseline_drop5_20": baseline_drop5_20,
+        "baseline_max_drop_20": baseline_max_drop_20,
         "trend_events": trend_df,
         "downside_events": downside_df,
         "baseline_down5": (baseline["ret_5"] < 0).mean() * 100,
@@ -1348,6 +1508,8 @@ def render_backtest(code, row_id, current_status, current_downside_risk):
             downside_scores = result["downside_scores"]
             performance = result["performance"]
             trend_risk = result["risk"]
+            condition_effects = result["condition_effects"]
+            condition_combinations = result["condition_combinations"]
 
             st.write(
                 f"検証期間： **{result['start'].date()} ～ {result['end'].date()}**  "
@@ -1469,6 +1631,95 @@ def render_backtest(code, row_id, current_status, current_downside_risk):
                     show_scores[col] = show_scores[col].map(lambda x: f"{x:.1f}%")
 
             st.dataframe(show_scores, use_container_width=True, hide_index=True)
+
+            # =================================================
+            # 条件ごとの効き方
+            # =================================================
+            st.markdown("### 🔬 どの条件が実際に効いているか")
+            st.caption(
+                f"全営業日の20日以内-5%到達率は "
+                f"{result['baseline_drop5_20']:.1f}%、平均最大下落は "
+                f"{result['baseline_max_drop_20']:.1f}%です。"
+                "各条件が新しく成立した日の実績と比較します。"
+            )
+
+            if condition_effects.empty:
+                st.info("条件別のバックテスト結果を十分に取得できませんでした。")
+            else:
+                reliable = condition_effects[condition_effects["発生回数"] >= 5].copy()
+
+                if not reliable.empty:
+                    strongest = reliable.sort_values(
+                        ["基準との差", "20日最大下落"],
+                        ascending=False,
+                    ).iloc[0]
+
+                    st.success(
+                        f"最も下振れとの関連が強かった条件は "
+                        f"**{strongest['条件']}**。"
+                        f"20日以内-5%は {float(strongest['20日以内-5%']):.1f}% "
+                        f"（全営業日より {float(strongest['基準との差']):+.1f}pt）でした。"
+                    )
+
+                    weak = reliable[
+                        (reliable["基準との差"] <= 0)
+                        & (reliable["20日最大下落"] <= result["baseline_max_drop_20"])
+                    ]
+                    if not weak.empty:
+                        names = "、".join(weak["条件"].astype(str).tolist())
+                        st.warning(
+                            f"**{names}** は単独では下落予測への寄与が弱い可能性があります。"
+                            "配点を下げる候補です。"
+                        )
+
+                show_conditions = condition_effects.copy()
+                for col in [
+                    "5日後下落率",
+                    "20日後下落率",
+                    "20日以内-5%",
+                    "基準との差",
+                    "20日最大下落",
+                    "20日最大上昇",
+                ]:
+                    if col in show_conditions.columns:
+                        if col == "基準との差":
+                            show_conditions[col] = show_conditions[col].map(lambda x: f"{x:+.1f}pt")
+                        else:
+                            show_conditions[col] = show_conditions[col].map(lambda x: f"{x:.1f}%")
+
+                st.dataframe(show_conditions, use_container_width=True, hide_index=True)
+                st.caption(
+                    "『配点候補』はバックテストからの参考値で、現在の本番判定には自動反映していません。"
+                    "サンプル数と条件の組み合わせを確認してから変更します。"
+                )
+
+            # -------------------------------------------------
+            # 条件2つの組み合わせ
+            # -------------------------------------------------
+            st.markdown("### 🧩 条件の組み合わせ")
+            if condition_combinations.empty:
+                st.info("3回以上発生した条件の組み合わせがありませんでした。")
+            else:
+                st.caption(
+                    "2条件が同時に成立し始めた日の実績です。"
+                    "単独では弱い条件でも、組み合わせると有効になる場合があります。"
+                )
+
+                show_combos = condition_combinations.head(10).copy()
+                for col in [
+                    "5日後下落率",
+                    "20日以内-5%",
+                    "基準との差",
+                    "20日最大下落",
+                    "20日最大上昇",
+                ]:
+                    if col in show_combos.columns:
+                        if col == "基準との差":
+                            show_combos[col] = show_combos[col].map(lambda x: f"{x:+.1f}pt")
+                        else:
+                            show_combos[col] = show_combos[col].map(lambda x: f"{x:.1f}%")
+
+                st.dataframe(show_combos, use_container_width=True, hide_index=True)
 
             # =================================================
             # 旧トレンド判定は参考として残す
