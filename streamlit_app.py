@@ -835,7 +835,10 @@ def get_position_judgment(price, buy_price, score, active_stop, stop_gap_pct, tp
 
 
 # =========================================================
-# 3年バックテスト
+# 3年バックテスト 強化版
+# ・同じ判定が続く日を何回も数えず「判定が変わった初日」だけ集計
+# ・5日/20日後の終値だけでなく、途中の最大下落/最大上昇も検証
+# ・現在の逆指値ルールに触れた割合と、その後の反発も検証
 # =========================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -843,7 +846,12 @@ def run_signal_backtest(code):
     ticker_code = normalize_ticker(code)
 
     try:
-        daily = retry_history(ticker_code, period="3y", interval="1d", attempts=3)
+        daily = retry_history(
+            ticker_code,
+            period="3y",
+            interval="1d",
+            attempts=3,
+        )
     except Exception:
         daily = yf.download(
             ticker_code,
@@ -870,14 +878,24 @@ def run_signal_backtest(code):
     if "Volume" not in daily.columns:
         daily["Volume"] = 0
 
-    if len(daily) < 120:
+    if len(daily) < 140:
         raise ValueError("バックテスト用データが不足しています。")
 
+    # -----------------------------------------------------
+    # 現在の基本テクニカルと同じ材料を日ごとに再計算
+    # -----------------------------------------------------
     daily["MA5"] = daily["Close"].rolling(5).mean()
     daily["MA25"] = daily["Close"].rolling(25).mean()
     daily["MA75"] = daily["Close"].rolling(75).mean()
     daily["LOW20"] = daily["Low"].rolling(20).min()
+    daily["PRIOR_LOW20"] = daily["Low"].shift(1).rolling(20).min()
     daily["VOL20"] = daily["Volume"].rolling(20).mean()
+
+    prev_close = daily["Close"].shift(1)
+    tr1 = daily["High"] - daily["Low"]
+    tr2 = (daily["High"] - prev_close).abs()
+    tr3 = (daily["Low"] - prev_close).abs()
+    daily["ATR14"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
 
     score = pd.Series(0.0, index=daily.index)
     score += daily["Close"].gt(daily["MA5"]).map({True: 1, False: -1})
@@ -903,36 +921,213 @@ def run_signal_backtest(code):
             return "🟠 注意"
         return "🔴 危険"
 
+    def risk_rank_from_score(value):
+        if value >= 4:
+            return 4
+        if value >= 2:
+            return 3
+        if value >= 0:
+            return 2
+        if value >= -2:
+            return 1
+        return 0
+
     daily["signal"] = daily["score"].apply(classify)
+    daily["risk_rank"] = daily["score"].apply(risk_rank_from_score)
+
+    indicator_ready = daily[["MA75", "LOW20", "PRIOR_LOW20", "ATR14"]].notna().all(axis=1)
+
+    # -----------------------------------------------------
+    # 重要：同じ判定が続く日を何回も数えない
+    # 「前日と判定が変わった初日」だけをシグナル発生日にする
+    # -----------------------------------------------------
+    daily["signal_event"] = (
+        indicator_ready
+        & indicator_ready.shift(1).fillna(False).astype(bool)
+        & daily["signal"].ne(daily["signal"].shift(1))
+    )
+
+    # 全営業日ベースの比較値
     daily["ret_5"] = (daily["Close"].shift(-5) / daily["Close"] - 1) * 100
     daily["ret_20"] = (daily["Close"].shift(-20) / daily["Close"] - 1) * 100
 
-    valid = daily.dropna(subset=["MA75", "LOW20", "ret_5", "ret_20"]).copy()
-    if valid.empty:
+    baseline = daily[
+        indicator_ready
+        & daily["ret_5"].notna()
+        & daily["ret_20"].notna()
+    ].copy()
+
+    if baseline.empty:
         raise ValueError("バックテスト可能な期間がありません。")
 
-    order = ["🟢 強い上昇", "🟢 上昇", "🟡 様子見", "🟠 注意", "🔴 危険"]
-    rows = []
+    events = []
+
+    for pos in range(len(daily)):
+        if not bool(daily["signal_event"].iloc[pos]):
+            continue
+
+        # 次の20営業日が存在するイベントだけ採用
+        if pos + 20 >= len(daily):
+            continue
+
+        row = daily.iloc[pos]
+        entry_price = float(row["Close"])
+
+        future5 = daily.iloc[pos + 1 : pos + 6]
+        future20 = daily.iloc[pos + 1 : pos + 21]
+
+        if len(future5) < 5 or len(future20) < 20:
+            continue
+
+        ret5 = (float(daily["Close"].iloc[pos + 5]) / entry_price - 1) * 100
+        ret20 = (float(daily["Close"].iloc[pos + 20]) / entry_price - 1) * 100
+
+        # 途中経過。最大下落は「何%下に行ったか」を正の数字で表示
+        max_drop_5 = max(0.0, (1 - float(future5["Low"].min()) / entry_price) * 100)
+        max_gain_5 = max(0.0, (float(future5["High"].max()) / entry_price - 1) * 100)
+        max_drop_20 = max(0.0, (1 - float(future20["Low"].min()) / entry_price) * 100)
+        max_gain_20 = max(0.0, (float(future20["High"].max()) / entry_price - 1) * 100)
+
+        # -------------------------------------------------
+        # 現在の逆指値ロジックを「シグナル発生日」に適用した参考ライン
+        # 危険シグナル初日は danger_streak=1 として扱う
+        # -------------------------------------------------
+        rank = int(row["risk_rank"])
+        danger_streak = 1 if rank == 0 else 0
+        atr14 = float(row["ATR14"])
+        prior_20_low = float(row["PRIOR_LOW20"])
+
+        stop_support = prior_20_low * 0.995
+        base_stop = min(stop_support, entry_price - atr14 * 1.5)
+
+        atr_multiplier, minimum_gap_pct, _ = get_stop_profile(
+            rank,
+            danger_streak,
+        )
+
+        defensive_atr_stop = entry_price - atr14 * atr_multiplier
+        minimum_gap_stop = entry_price * (1 - minimum_gap_pct)
+        defensive_stop = min(defensive_atr_stop, minimum_gap_stop)
+
+        if rank == 4:
+            stop_price = base_stop
+        else:
+            stop_price = max(base_stop, defensive_stop)
+
+        stop_price = min(stop_price, entry_price * 0.995)
+        stop_return = (stop_price / entry_price - 1) * 100
+
+        stop_hit_5 = bool((future5["Low"] <= stop_price).any())
+        stop_hit_20 = bool((future20["Low"] <= stop_price).any())
+
+        # 逆指値に触れた「後の日」に買値まで戻ったか
+        rebound_to_entry = False
+        stop_helped_vs_20d_close = False
+
+        if stop_hit_20:
+            hit_position = None
+            for j in range(len(future20)):
+                if float(future20["Low"].iloc[j]) <= stop_price:
+                    hit_position = j
+                    break
+
+            if hit_position is not None:
+                # 同日の高値・安値の順序は日足では分からないので翌日以降だけを見る
+                after_hit = future20.iloc[hit_position + 1 :]
+                if not after_hit.empty:
+                    rebound_to_entry = bool((after_hit["High"] >= entry_price).any())
+
+            # 20日後まで持ち続けた結果より、逆指値価格で撤退した方が損失が小さかったか
+            stop_helped_vs_20d_close = ret20 < stop_return
+
+        events.append(
+            {
+                "date": daily.index[pos],
+                "signal": row["signal"],
+                "entry": entry_price,
+                "ret_5": ret5,
+                "ret_20": ret20,
+                "max_drop_5": max_drop_5,
+                "max_gain_5": max_gain_5,
+                "max_drop_20": max_drop_20,
+                "max_gain_20": max_gain_20,
+                "stop_price": stop_price,
+                "stop_hit_5": stop_hit_5,
+                "stop_hit_20": stop_hit_20,
+                "rebound_to_entry": rebound_to_entry,
+                "stop_helped_vs_20d_close": stop_helped_vs_20d_close,
+            }
+        )
+
+    event_df = pd.DataFrame(events)
+
+    if event_df.empty:
+        raise ValueError("判定変化のシグナルを十分に取得できませんでした。")
+
+    order = [
+        "🟢 強い上昇",
+        "🟢 上昇",
+        "🟡 様子見",
+        "🟠 注意",
+        "🔴 危険",
+    ]
+
+    performance_rows = []
+    risk_rows = []
+
     for signal in order:
-        part = valid[valid["signal"] == signal]
+        part = event_df[event_df["signal"] == signal]
         if part.empty:
             continue
-        rows.append({
-            "判定": signal,
-            "回数": len(part),
-            "5日後上昇率": (part["ret_5"] > 0).mean() * 100,
-            "5日後平均": part["ret_5"].mean(),
-            "20日後上昇率": (part["ret_20"] > 0).mean() * 100,
-            "20日後平均": part["ret_20"].mean(),
-        })
+
+        stop_hits = part[part["stop_hit_20"]]
+
+        rebound_rate = (
+            stop_hits["rebound_to_entry"].mean() * 100
+            if not stop_hits.empty
+            else 0.0
+        )
+
+        stop_help_rate = (
+            stop_hits["stop_helped_vs_20d_close"].mean() * 100
+            if not stop_hits.empty
+            else 0.0
+        )
+
+        performance_rows.append(
+            {
+                "判定": signal,
+                "発生回数": len(part),
+                "5日後上昇率": (part["ret_5"] > 0).mean() * 100,
+                "5日後平均": part["ret_5"].mean(),
+                "20日後上昇率": (part["ret_20"] > 0).mean() * 100,
+                "20日後平均": part["ret_20"].mean(),
+            }
+        )
+
+        risk_rows.append(
+            {
+                "判定": signal,
+                "5日最大下落": part["max_drop_5"].mean(),
+                "5日最大上昇": part["max_gain_5"].mean(),
+                "20日最大下落": part["max_drop_20"].mean(),
+                "20日最大上昇": part["max_gain_20"].mean(),
+                "20日逆指値到達": part["stop_hit_20"].mean() * 100,
+                "到達後買値回復": rebound_rate,
+                "逆指値有効": stop_help_rate,
+            }
+        )
 
     return {
-        "summary": pd.DataFrame(rows),
-        "overall_up5": (valid["ret_5"] > 0).mean() * 100,
-        "overall_up20": (valid["ret_20"] > 0).mean() * 100,
-        "samples": len(valid),
-        "start": valid.index.min(),
-        "end": valid.index.max(),
+        "performance": pd.DataFrame(performance_rows),
+        "risk": pd.DataFrame(risk_rows),
+        "events": event_df,
+        "baseline_up5": (baseline["ret_5"] > 0).mean() * 100,
+        "baseline_up20": (baseline["ret_20"] > 0).mean() * 100,
+        "baseline_samples": len(baseline),
+        "event_samples": len(event_df),
+        "start": event_df["date"].min(),
+        "end": event_df["date"].max(),
     }
 
 
@@ -941,60 +1136,138 @@ def render_backtest(code, row_id, current_status):
 
     with st.expander("🧪 この判定を過去3年で検証"):
         st.caption(
-            "移動平均・20日安値・出来高を使う現在の基本スコアを、"
-            "過去約3年の日足で検証します。"
+            "同じ判定が何日も続いても重複カウントせず、"
+            "判定が変わった最初の日だけを1回のシグナルとして検証します。"
         )
 
         if st.button(
-            "▶ 3年バックテストを実行",
+            "▶ 強化バックテストを実行",
             key=f"run_backtest_{row_id}",
             use_container_width=True,
         ):
             st.session_state[session_key] = True
 
         if not st.session_state.get(session_key, False):
-            st.info("上のボタンを押すと結果を表示します。")
+            st.info("上のボタンを押すと、終値だけでなく途中の下落・反発・逆指値まで検証します。")
             return
 
         try:
-            with st.spinner("過去3年を検証しています..."):
+            with st.spinner("過去3年のシグナル発生日を検証しています..."):
                 result = run_signal_backtest(code)
 
-            summary = result["summary"]
+            performance = result["performance"]
+            risk = result["risk"]
+
             st.write(
-                f"検証期間： **{result['start'].date()} ～ {result['end'].date()}** "
-                f"（{result['samples']:,}営業日）"
+                f"検証期間： **{result['start'].date()} ～ {result['end'].date()}**  "
+                f"判定変化： **{result['event_samples']:,}回**"
             )
 
-            current = summary[summary["判定"] == current_status]
-            if not current.empty:
-                r = current.iloc[0]
+            st.caption(
+                f"参考：全営業日ベースでは5日後上昇 {result['baseline_up5']:.1f}% / "
+                f"20日後上昇 {result['baseline_up20']:.1f}% です。"
+            )
+
+            current_perf = performance[performance["判定"] == current_status]
+            current_risk = risk[risk["判定"] == current_status]
+
+            if not current_perf.empty and not current_risk.empty:
+                p = current_perf.iloc[0]
+                r = current_risk.iloc[0]
+                n = int(p["発生回数"])
+
+                st.markdown(f"#### 今の判定：{current_status} の過去実績")
+
                 if current_status in ["🔴 危険", "🟠 注意"]:
-                    down5 = 100 - float(r["5日後上昇率"])
-                    down20 = 100 - float(r["20日後上昇率"])
+                    down5 = 100 - float(p["5日後上昇率"])
+                    down20 = 100 - float(p["20日後上昇率"])
+
                     c1, c2 = st.columns(2)
                     with c1:
                         st.metric("5日後に下落", f"{down5:.1f}%")
                     with c2:
                         st.metric("20日後に下落", f"{down20:.1f}%")
-                    normal_down5 = 100 - result["overall_up5"]
-                    st.caption(f"全期間の5日後下落率は {normal_down5:.1f}% です。")
                 else:
                     c1, c2 = st.columns(2)
                     with c1:
-                        st.metric("5日後に上昇", f"{float(r['5日後上昇率']):.1f}%")
+                        st.metric("5日後に上昇", f"{float(p['5日後上昇率']):.1f}%")
                     with c2:
-                        st.metric("20日後に上昇", f"{float(r['20日後上昇率']):.1f}%")
-                    st.caption(f"全期間の5日後上昇率は {result['overall_up5']:.1f}% です。")
+                        st.metric("20日後に上昇", f"{float(p['20日後上昇率']):.1f}%")
 
-            show = summary.copy()
+                c3, c4 = st.columns(2)
+                with c3:
+                    st.metric("20日以内の平均最大下落", f"{float(r['20日最大下落']):.1f}%")
+                with c4:
+                    st.metric("20日以内の平均最大上昇", f"{float(r['20日最大上昇']):.1f}%")
+
+                c5, c6 = st.columns(2)
+                with c5:
+                    st.metric("逆指値に到達", f"{float(r['20日逆指値到達']):.1f}%")
+                with c6:
+                    st.metric("到達後に買値まで回復", f"{float(r['到達後買値回復']):.1f}%")
+
+                # -------------------------------------------------
+                # 読み取り補助
+                # -------------------------------------------------
+                if n < 10:
+                    st.warning(
+                        f"この判定の発生回数は {n}回です。"
+                        "サンプルが少ないため、割合はまだ大きくブレる可能性があります。"
+                    )
+
+                if current_status in ["🔴 危険", "🟠 注意"]:
+                    baseline_down5 = 100 - result["baseline_up5"]
+                    current_down5 = 100 - float(p["5日後上昇率"])
+
+                    if current_down5 <= baseline_down5:
+                        st.warning(
+                            "⚠️ この下落警戒判定は、5日後の下落を全営業日平均より"
+                            "強く予測できていません。売却判断の単独根拠にはしない方がよい結果です。"
+                        )
+                    else:
+                        st.success(
+                            "この判定が出た後の5日下落率は全営業日平均より高く、"
+                            "下落警戒として一定の識別力があります。"
+                        )
+
+                if float(r["20日逆指値到達"]) >= 40 and float(r["到達後買値回復"]) >= 50:
+                    st.warning(
+                        "⚠️ 逆指値に触れた後で買値まで戻るケースが多めです。"
+                        "現在の逆指値がやや近すぎる可能性があります。"
+                    )
+                elif float(r["逆指値有効"]) >= 60:
+                    st.success(
+                        "逆指値に触れたケースでは、20日後まで持ち続けるより"
+                        "早めに撤退した方が損失を抑えられた割合が高めです。"
+                    )
+
+            st.markdown("#### 📊 判定が変わった日のその後")
+            show_perf = performance.copy()
             for col in ["5日後上昇率", "5日後平均", "20日後上昇率", "20日後平均"]:
-                show[col] = show[col].map(lambda x: f"{x:.1f}%")
+                show_perf[col] = show_perf[col].map(lambda x: f"{x:.1f}%")
+            st.dataframe(show_perf, use_container_width=True, hide_index=True)
 
-            st.dataframe(show, use_container_width=True, hide_index=True)
+            st.markdown("#### 🛡️ 途中の値動き・逆指値")
+            show_risk = risk.copy()
+            for col in [
+                "5日最大下落",
+                "5日最大上昇",
+                "20日最大下落",
+                "20日最大上昇",
+                "20日逆指値到達",
+                "到達後買値回復",
+                "逆指値有効",
+            ]:
+                show_risk[col] = show_risk[col].map(lambda x: f"{x:.1f}%")
+            st.dataframe(show_risk, use_container_width=True, hide_index=True)
+
             st.caption(
-                "※場中の節目突破、ニュース、決算、地合い、買値、"
-                "保存済み逆指値まではこのバックテストに含めていません。"
+                "『逆指値有効』＝逆指値に触れたケースのうち、"
+                "20日後まで保有した終値より逆指値で撤退した方が損失を抑えられた割合。"
+            )
+            st.caption(
+                "※日足バックテストなので、同じ日の高値と安値のどちらが先だったかは分かりません。"
+                "場中の節目突破、ニュース、決算、地合い、実際の約定スリッページも含めていません。"
             )
 
         except Exception as e:
