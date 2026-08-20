@@ -487,17 +487,14 @@ def get_round_level_state(price, daily, intraday, market_open, saved_breakout_le
 # =========================================================
 
 def get_stop_profile(downside_risk):
-    # バックテスト上、単なる「弱いトレンド」は反発が多かったため、
-    # 逆指値はトレンド点数ではなく「下落継続リスク」で締める。
-    if downside_risk <= 0:
+    # V7: 3年バックテストで高リスク帯の最大下落が明確に大きかったため、
+    # 採用配点のリスク帯に合わせて逆指値を段階的に締める。
+    # ただし高リスクのサンプルはまだ少ないので締めすぎない。
+    if downside_risk <= 1:
         return 1.50, 0.030, "下落継続リスク低"
-    if downside_risk == 1:
-        return 1.40, 0.028, "下落継続リスクやや低"
-    if downside_risk == 2:
-        return 1.30, 0.026, "下落継続リスク注意"
-    if downside_risk == 3:
-        return 1.20, 0.024, "下落継続リスク高め"
-    return 1.00, 0.020, "下落継続リスク高"
+    if downside_risk <= 3:
+        return 1.35, 0.028, "下落継続リスク注意"
+    return 1.15, 0.024, "下落継続リスク高"
 
 
 # =========================================================
@@ -714,8 +711,11 @@ def analyze_stock(code, saved_breakout_level=None, previous_danger_streak=0):
     danger_streak = previous_danger_streak + 1 if risk_rank == 0 else 0
 
     # =====================================================
-    # 下落継続リスク
-    # 「今まで弱かった」ことと「これからさらに下がる」を分離する
+    # 下落継続リスク V7（正式採用モデル）
+    # 3年バックテスト結果を反映：
+    # ・株価が25日線より下、だけでは0点
+    # ・下落日の出来高増を2点
+    # ・安値割れ＋急落/出来高、25日線下降＋出来高を追加加点
     # =====================================================
     ma25_5days_ago = float(daily["MA25"].iloc[-6]) if len(daily) >= 6 else ma25
     ma25_slope_pct = (ma25 / ma25_5days_ago - 1) * 100 if ma25_5days_ago else 0.0
@@ -727,51 +727,42 @@ def analyze_stock(code, saved_breakout_level=None, previous_danger_streak=0):
 
     if breakdown_confirmed:
         downside_risk += 2
-        downside_reasons.append("20日安値を0.5%以上割り込み")
+        downside_reasons.append("20日安値を0.5%以上割り込み：+2")
+
+    # 25日線より下は、単独では下落予測力がほぼ無かったため0点。
     if latest_price < ma25:
-        downside_risk += 1
-        downside_reasons.append("株価が25日線より下")
+        downside_reasons.append("株価が25日線より下：参考（0点）")
+
     if ma25_slope_pct < 0:
         downside_risk += 1
-        downside_reasons.append("25日線が下降中")
+        downside_reasons.append("25日線が下降中：+1")
+
     if change_pct <= -2.0:
         downside_risk += 1
-        downside_reasons.append("前日比-2%以上")
-    if down_volume:
-        downside_risk += 1
-        downside_reasons.append("下落日に出来高増")
+        downside_reasons.append("前日比-2%以上：+1")
 
-    # -------------------------------------------------
-    # 検証中の候補配点
-    # 本番の売却判断・逆指値にはまだ使わない
-    # -------------------------------------------------
-    candidate_downside_risk = 0
-
-    if breakdown_confirmed:
-        candidate_downside_risk += 2
-    if ma25_slope_pct < 0:
-        candidate_downside_risk += 1
-    if change_pct <= -2.0:
-        candidate_downside_risk += 1
     if down_volume:
-        candidate_downside_risk += 2
+        downside_risk += 2
+        downside_reasons.append("下落日に出来高増：+2")
 
     # 組み合わせボーナス
     if breakdown_confirmed and change_pct <= -2.0:
-        candidate_downside_risk += 2
+        downside_risk += 2
+        downside_reasons.append("安値割れ＋前日比-2%以上：追加+2")
+
     if breakdown_confirmed and down_volume:
-        candidate_downside_risk += 2
+        downside_risk += 2
+        downside_reasons.append("安値割れ＋下落出来高増：追加+2")
+
     if ma25_slope_pct < 0 and down_volume:
-        candidate_downside_risk += 1
+        downside_risk += 1
+        downside_reasons.append("25日線下降＋下落出来高増：追加+1")
 
-    candidate_downside_label = downside_band_from_score(candidate_downside_risk)
+    downside_label = downside_band_from_score(downside_risk)
 
-    if downside_risk >= 4:
-        downside_label = "🔴 高い"
-    elif downside_risk >= 2:
-        downside_label = "🟠 注意"
-    else:
-        downside_label = "🟢 低め"
+    # 旧V7との互換用。候補モデルはV7で正式採用済み。
+    candidate_downside_risk = downside_risk
+    candidate_downside_label = downside_label
 
     stop_support = prior_20_low * 0.995
     base_stop = min(stop_support, latest_price - atr14 * 1.5)
@@ -784,7 +775,7 @@ def analyze_stock(code, saved_breakout_level=None, previous_danger_streak=0):
     minimum_gap_stop = latest_price * (1 - minimum_gap_pct)
     defensive_stop = min(defensive_atr_stop, minimum_gap_stop)
 
-    if downside_risk <= 0:
+    if downside_risk <= 1:
         stop_candidate = base_stop
     else:
         stop_candidate = max(base_stop, defensive_stop)
@@ -901,18 +892,25 @@ def get_position_judgment(
     if price >= tp1:
         return "🟢 一部利確を検討", "1.5Rの利確目安に到達しています。"
 
-    # 単なる弱いトレンドだけでは売却にしない。
-    # 20日安値割れ・25日線下降・急落・下落出来高などが重なる時だけ強く警戒。
+    # V7: 売却判断は旧トレンド色ではなく、実績の出た下落継続リスクを優先。
+    # 高リスク帯は20日以内-5%の発生率が大きく上がったため明確に警戒する。
+    # ただしサンプル数はまだ少ないため、高リスクだけで即全売却にはしない。
     if downside_risk >= 4 and breakdown_confirmed:
         return (
-            "🔴 売却・一部撤退を検討",
-            "弱いトレンドだけでなく、安値割れなど下落継続の条件が複数重なっています。",
+            "🔴 売却・一部撤退を強く検討",
+            "下落継続リスクが高く、20日安値も明確に割っています。逆指値到達を待つだけでなく一部撤退も検討する局面です。",
+        )
+
+    if downside_risk >= 4:
+        return (
+            "🔴 強く警戒・一部撤退を検討",
+            "バックテストで高リスク帯は20日以内の大きな下落が増えました。全売却を即断せず、逆指値と一部撤退を優先します。",
         )
 
     if downside_risk >= 2 or stop_gap_pct <= 2:
         return (
-            "🟠 保有継続・強く警戒",
-            "下落継続リスクが上がっています。逆指値と安値割れを優先して確認します。",
+            "🟠 保有継続・警戒",
+            "下落継続リスクは注意帯です。逆指値を維持し、安値割れ・出来高を確認します。",
         )
 
     if score <= -3:
@@ -928,7 +926,7 @@ def get_position_judgment(
 
 
 # =========================================================
-# 3年バックテスト V6
+# 3年バックテスト V7
 # ・旧トレンド判定だけでなく「下落継続リスク」そのものを検証
 # ・同じ状態が続く日を重複カウントせず、状態が変わった初日を1回とする
 # ・5日/20日後の終値、途中の最大下落/上昇、逆指値到達まで確認
@@ -1056,7 +1054,7 @@ def run_signal_backtest(code):
     daily["downside_band"] = daily["downside_risk"].apply(downside_band_from_score)
 
     # -----------------------------------------------------
-    # 候補配点モデル（V6検証用）
+    # 候補配点モデル（V7検証用）
     # 25日線より下は0点、出来高増を重くし、
     # 安値割れ＋急落/出来高などの組み合わせを加点
     # -----------------------------------------------------
@@ -1090,6 +1088,10 @@ def run_signal_backtest(code):
     daily["candidate_downside_band"] = daily["candidate_downside_risk"].apply(
         downside_band_from_score
     )
+
+    # V7では候補配点を正式採用。以下の主バックテストも採用モデルで集計する。
+    daily["downside_risk"] = daily["candidate_downside_risk"]
+    daily["downside_band"] = daily["candidate_downside_band"]
 
     # -----------------------------------------------------
     # 下落継続リスクを構成する各条件
@@ -1179,7 +1181,7 @@ def run_signal_backtest(code):
         minimum_gap_stop = entry_price * (1 - minimum_gap_pct)
         defensive_stop = min(defensive_atr_stop, minimum_gap_stop)
 
-        if downside_risk <= 0:
+        if downside_risk <= 1:
             stop_price = base_stop
         else:
             stop_price = max(base_stop, defensive_stop)
@@ -1751,16 +1753,16 @@ def render_backtest(code, row_id, current_status, current_downside_risk, current
             # =================================================
             # 候補配点モデルを再検証
             # =================================================
-            st.markdown("### 🧪 候補配点モデルの再検証")
+            st.markdown("### ✅ 採用中の下落継続リスクモデル")
             st.caption(
-                "本番判定はまだ変更していません。"
-                "25日線より下を0点、出来高増を2点にし、"
-                "安値割れ＋急落/出来高などの組み合わせを追加した候補モデルです。"
+                "現在の本番判定に採用している配点です。"
+                "25日線より下は0点、出来高増を2点にし、"
+                "安値割れ＋急落/出来高などの組み合わせを重く見ます。"
             )
 
             candidate_band = downside_band_from_score(current_candidate_risk)
             st.markdown(
-                f"#### 現在を候補配点で見ると：{candidate_band} "
+                f"#### 現在の採用配点では：{candidate_band} "
                 f"（スコア {int(current_candidate_risk)}）"
             )
 
@@ -1810,21 +1812,21 @@ def render_backtest(code, row_id, current_status, current_downside_risk, current
 
                     if high_n >= 10 and crash_gap >= 20 and draw_gap >= 1.0:
                         st.success(
-                            "✅ 候補配点はかなり有望です。"
+                            "✅ 採用配点は良好に分離できています。"
                             f"高リスクは低リスクより20日以内-5%が "
                             f"{crash_gap:+.1f}pt高く、最大下落も "
                             f"{draw_gap:+.1f}pt大きくなっています。"
                         )
                     elif crash_gap > 0 or draw_gap > 0:
                         st.warning(
-                            "⚠️ 候補配点は改善傾向がありますが、"
+                            "⚠️ 採用配点は改善傾向がありますが、"
                             f"高リスクの発生回数は {high_n}回です。"
                             "サンプル数と差を見てから本番反映を判断します。"
                         )
                     else:
                         st.error(
                             "❌ 候補配点では高リスクほど悪化する形が出ていません。"
-                            "この配点は本番には反映しない方がよい結果です。"
+                            "この配点は今後見直す必要があります。"
                         )
 
             # =================================================

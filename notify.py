@@ -275,18 +275,23 @@ def get_round_level_state(price, daily, intraday, market_open, saved_breakout_le
 # 逆指値プロファイル
 # =========================================================
 
+def downside_band_from_score(value):
+    value = int(value)
+    if value >= 4:
+        return "🔴 高い"
+    if value >= 2:
+        return "🟠 注意"
+    return "🟢 低め"
+
+
 def get_stop_profile(downside_risk):
-    # 単なる弱いトレンドでは逆指値を強く締めない。
-    # 安値割れ・25日線下降・急落・下落出来高の重なりで調整する。
-    if downside_risk <= 0:
+    # V4: 3年バックテストで採用した新配点に合わせる。
+    # 高リスク帯は明確に下振れが大きいが、サンプル数はまだ少ないため締めすぎない。
+    if downside_risk <= 1:
         return 1.50, 0.030, "下落継続リスク低"
-    if downside_risk == 1:
-        return 1.40, 0.028, "下落継続リスクやや低"
-    if downside_risk == 2:
-        return 1.30, 0.026, "下落継続リスク注意"
-    if downside_risk == 3:
-        return 1.20, 0.024, "下落継続リスク高め"
-    return 1.00, 0.020, "下落継続リスク高"
+    if downside_risk <= 3:
+        return 1.35, 0.028, "下落継続リスク注意"
+    return 1.15, 0.024, "下落継続リスク高"
 
 
 # =========================================================
@@ -436,7 +441,7 @@ def check_stock(row, previous_state=None):
     previous_danger_streak = max(clean_int(previous_state.get("danger_streak", 0), 0), 0)
     danger_streak = previous_danger_streak + 1 if risk_rank == 0 else 0
 
-    # 下落継続リスクを別計算
+    # 下落継続リスク V4（正式採用配点）
     ma25_series = closes.rolling(25).mean()
     ma25_5days_ago = float(ma25_series.iloc[-6]) if len(ma25_series) >= 6 else ma25
     ma25_slope_pct = (ma25 / ma25_5days_ago - 1) * 100 if ma25_5days_ago else 0.0
@@ -446,14 +451,23 @@ def check_stock(row, previous_state=None):
     downside_risk = 0
     if breakdown_confirmed:
         downside_risk += 2
-    if price < ma25:
-        downside_risk += 1
+    # price < ma25 は単独では予測力が弱かったため0点
     if ma25_slope_pct < 0:
         downside_risk += 1
     if change_pct <= -2.0:
         downside_risk += 1
     if down_volume:
+        downside_risk += 2
+
+    # 組み合わせボーナス
+    if breakdown_confirmed and change_pct <= -2.0:
+        downside_risk += 2
+    if breakdown_confirmed and down_volume:
+        downside_risk += 2
+    if ma25_slope_pct < 0 and down_volume:
         downside_risk += 1
+
+    downside_band = downside_band_from_score(downside_risk)
 
     stop_support = prior_20_low * 0.995
     base_stop = min(stop_support, price - atr14 * 1.5)
@@ -466,7 +480,7 @@ def check_stock(row, previous_state=None):
     minimum_gap_stop = price * (1 - minimum_gap_pct)
     defensive_stop = min(defensive_atr_stop, minimum_gap_stop)
 
-    stop_candidate = base_stop if downside_risk <= 0 else max(base_stop, defensive_stop)
+    stop_candidate = base_stop if downside_risk <= 1 else max(base_stop, defensive_stop)
     stop_candidate = min(stop_candidate, price * 0.995)
     stop_candidate = float(round(stop_candidate))
 
@@ -515,6 +529,7 @@ def check_stock(row, previous_state=None):
         "status": status,
         "danger_streak": danger_streak,
         "downside_risk": downside_risk,
+        "downside_band": downside_band,
         "breakdown_confirmed": breakdown_confirmed,
         "ma25_slope_pct": ma25_slope_pct,
         "stop_profile_text": stop_profile_text,
@@ -572,6 +587,19 @@ for row in holdings:
         previous_rank = clean_int(previous.get("risk_rank", 4), 4)
         if current["risk_rank"] < previous_rank:
             reasons.append(f"判定悪化 → {current['status']}")
+
+    # 下落継続リスクの上昇（V4正式採用モデル）
+    previous_downside = clean_int(previous.get("downside_score", 0), 0) if previous else 0
+    current_downside = int(current["downside_risk"])
+
+    if current_downside >= 4 and previous_downside < 4:
+        reasons.append(
+            f"🚨 下落継続リスクが高に上昇（{current_downside}点）"
+        )
+    elif current_downside >= 2 and current_downside > previous_downside:
+        reasons.append(
+            f"⚠️ 下落継続リスク上昇 → {current['downside_band']}（{current_downside}点）"
+        )
 
     # 急落
     previous_drop = bool(previous.get("sudden_drop", False)) if previous else False
@@ -645,6 +673,8 @@ for row in holdings:
         "ticker": code,
         "risk_rank": current["risk_rank"],
         "score": current["score"],
+        "downside_score": current["downside_risk"],
+        "downside_band": current["downside_band"],
         "danger_streak": current["danger_streak"],
         "sudden_drop": current["sudden_drop"],
         "stop_near": current["stop_near"],
@@ -671,6 +701,9 @@ if alerts:
     for stock in alerts:
         lines.append(f"{stock['status']} {stock['ticker']} {stock['name']}")
         lines.append(f"現在値 {stock['price']:,.0f}円 ({stock['change_pct']:+.2f}%)")
+        lines.append(
+            f"下落継続リスク {stock['downside_band']}（{stock['downside_risk']}点）"
+        )
 
         for reason in stock["alert_reasons"]:
             lines.append(f"・{reason}")
