@@ -1,4 +1,5 @@
 import os
+
 from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
 from io import BytesIO
@@ -17,73 +18,23 @@ JPX_URL = (
     "misc/tvdivq0000001vg2-att/data_j.xls"
 )
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-NTFY_TOPIC = os.environ["NTFY_TOPIC"]
+SUPABASE_URL = os.environ[
+    "SUPABASE_URL"
+]
+
+SUPABASE_KEY = os.environ[
+    "SUPABASE_KEY"
+]
+
+NTFY_TOPIC = os.environ[
+    "NTFY_TOPIC"
+]
 
 
 supabase = create_client(
     SUPABASE_URL,
     SUPABASE_KEY
 )
-
-
-# =========================================================
-# JPX銘柄一覧
-# =========================================================
-
-def get_jpx_names():
-
-    try:
-
-        response = requests.get(
-            JPX_URL,
-            timeout=30,
-            headers={
-                "User-Agent": "Mozilla/5.0"
-            }
-        )
-
-        response.raise_for_status()
-
-        df = pd.read_excel(
-            BytesIO(response.content),
-            engine="xlrd"
-        )
-
-        result = {}
-
-        for _, row in df.iterrows():
-
-            code = str(
-                row.get("コード", "")
-            ).strip()
-
-            if code.endswith(".0"):
-                code = code[:-2]
-
-            if (
-                code.isdigit()
-                and len(code) < 4
-            ):
-
-                code = code.zfill(4)
-
-            name = str(
-                row.get("銘柄名", "")
-            ).strip()
-
-            if code and name:
-                result[code] = name
-
-        return result
-
-    except Exception:
-
-        return {}
-
-
-JPX_NAMES = get_jpx_names()
 
 
 # =========================================================
@@ -94,47 +45,198 @@ def normalize_ticker(code):
 
     code = str(code).strip()
 
-    if code.isdigit() and len(code) == 4:
+    if (
+        code.isdigit()
+        and len(code) == 4
+    ):
+
         return f"{code}.T"
 
     return code
 
 
-def company_name(code):
-
-    code = str(code).strip()
-
-    if code in JPX_NAMES:
-        return JPX_NAMES[code]
-
-    try:
-
-        info = yf.Ticker(
-            normalize_ticker(code)
-        ).get_info()
-
-        return (
-            info.get("shortName")
-            or info.get("longName")
-            or code
-        )
-
-    except Exception:
-
-        return code
-
-
 def to_jst_naive(index):
 
-    index = pd.DatetimeIndex(index)
+    index = pd.DatetimeIndex(
+        index
+    )
 
     if index.tz is None:
         return index
 
     return (
         index
-        .tz_convert("Asia/Tokyo")
+        .tz_convert(
+            "Asia/Tokyo"
+        )
         .tz_localize(None)
+    )
+
+
+# =========================================================
+# JPX銘柄名
+# =========================================================
+
+def get_jpx_names():
+
+    try:
+
+        response = requests.get(
+            JPX_URL,
+
+            timeout=30,
+
+            headers={
+                "User-Agent":
+                    "Mozilla/5.0"
+            }
+        )
+
+        response.raise_for_status()
+
+        df = pd.read_excel(
+            BytesIO(
+                response.content
+            ),
+
+            engine="xlrd"
+        )
+
+
+        result = {}
+
+
+        for _, row in df.iterrows():
+
+            code = str(
+                row.get(
+                    "コード",
+                    ""
+                )
+            ).strip()
+
+
+            if code.endswith(".0"):
+
+                code = code[:-2]
+
+
+            if (
+                code.isdigit()
+                and len(code) < 4
+            ):
+
+                code = code.zfill(4)
+
+
+            name = str(
+                row.get(
+                    "銘柄名",
+                    ""
+                )
+            ).strip()
+
+
+            if code and name:
+
+                result[
+                    code
+                ] = name
+
+
+        return result
+
+
+    except Exception:
+
+        return {}
+
+
+JPX_NAMES = get_jpx_names()
+
+
+def company_name(code):
+
+    code = str(code).strip()
+
+
+    if code in JPX_NAMES:
+
+        return JPX_NAMES[
+            code
+        ]
+
+
+    try:
+
+        info = (
+            yf.Ticker(
+                normalize_ticker(
+                    code
+                )
+            )
+            .get_info()
+        )
+
+
+        return (
+            info.get(
+                "shortName"
+            )
+            or info.get(
+                "longName"
+            )
+            or code
+        )
+
+
+    except Exception:
+
+        return code
+
+
+# =========================================================
+# 利確ライン
+# =========================================================
+
+def get_take_profit_lines(
+    buy_price,
+    initial_stop,
+    atr14
+):
+
+    if initial_stop < buy_price:
+
+        risk = (
+            buy_price
+            - initial_stop
+        )
+
+
+    else:
+
+        risk = max(
+            atr14 * 1.5,
+            buy_price * 0.03
+        )
+
+
+    tp1 = round(
+        buy_price
+        + risk * 1.5
+    )
+
+
+    tp2 = round(
+        buy_price
+        + risk * 2.0
+    )
+
+
+    return (
+        risk,
+        float(tp1),
+        float(tp2)
     )
 
 
@@ -145,12 +247,18 @@ def to_jst_naive(index):
 def check_stock(row):
 
     code = str(
-        row["ticker"]
+        row[
+            "ticker"
+        ]
     ).strip()
 
-    ticker_code = normalize_ticker(
-        code
+
+    ticker_code = (
+        normalize_ticker(
+            code
+        )
     )
+
 
     stock = yf.Ticker(
         ticker_code
@@ -182,14 +290,12 @@ def check_stock(row):
 
     daily = daily.copy()
 
-    daily.index = to_jst_naive(
-        daily.index
+    daily.index = (
+        to_jst_naive(
+            daily.index
+        )
     )
 
-
-    # =====================================================
-    # 5分足
-    # =====================================================
 
     try:
 
@@ -201,6 +307,7 @@ def check_stock(row):
             actions=False
         )
 
+
     except Exception:
 
         intraday = pd.DataFrame()
@@ -208,23 +315,24 @@ def check_stock(row):
 
     if not intraday.empty:
 
-        intraday = intraday.dropna(
-            subset=[
-                "Open",
-                "High",
-                "Low",
-                "Close"
-            ]
+        intraday = (
+            intraday.dropna(
+                subset=[
+                    "Open",
+                    "High",
+                    "Low",
+                    "Close"
+                ]
+            )
         )
 
-        intraday.index = to_jst_naive(
-            intraday.index
+
+        intraday.index = (
+            to_jst_naive(
+                intraday.index
+            )
         )
 
-
-    # =====================================================
-    # 最新価格
-    # =====================================================
 
     try:
 
@@ -234,6 +342,7 @@ def check_stock(row):
             ]
         )
 
+
     except Exception:
 
         fast_price = None
@@ -242,6 +351,7 @@ def check_stock(row):
     now = datetime.now(
         JST
     )
+
 
     market_open = (
         now.weekday() < 5
@@ -291,16 +401,11 @@ def check_stock(row):
         )
 
 
-    # 最新価格を今日のCloseへ反映
     daily.loc[
         daily.index[-1],
         "Close"
     ] = price
 
-
-    # =====================================================
-    # 前日比
-    # =====================================================
 
     previous_close = float(
         daily[
@@ -315,11 +420,9 @@ def check_stock(row):
     ) / previous_close * 100
 
 
-    # =====================================================
-    # 移動平均
-    # =====================================================
-
-    closes = daily["Close"]
+    closes = daily[
+        "Close"
+    ]
 
 
     ma5 = float(
@@ -346,41 +449,50 @@ def check_stock(row):
     )
 
 
-    # =====================================================
-    # 過去20日安値
-    # =====================================================
-
     prior_20_low = float(
-        daily["Low"]
+        daily[
+            "Low"
+        ]
         .iloc[:-1]
         .tail(20)
         .min()
     )
 
 
-    # =====================================================
-    # ATR
-    # =====================================================
-
     previous_series = (
-        daily["Close"]
+        daily[
+            "Close"
+        ]
         .shift(1)
     )
 
 
     tr1 = (
-        daily["High"]
-        - daily["Low"]
+        daily[
+            "High"
+        ]
+        -
+        daily[
+            "Low"
+        ]
     )
 
+
     tr2 = (
-        daily["High"]
-        - previous_series
+        daily[
+            "High"
+        ]
+        -
+        previous_series
     ).abs()
 
+
     tr3 = (
-        daily["Low"]
-        - previous_series
+        daily[
+            "Low"
+        ]
+        -
+        previous_series
     ).abs()
 
 
@@ -390,6 +502,7 @@ def check_stock(row):
             tr2,
             tr3
         ],
+
         axis=1
     ).max(
         axis=1
@@ -405,7 +518,7 @@ def check_stock(row):
 
 
     # =====================================================
-    # 逆指値候補
+    # 逆指値
     # =====================================================
 
     stop_support = (
@@ -413,10 +526,12 @@ def check_stock(row):
         * 0.995
     )
 
+
     stop_atr = (
         price
         - atr14 * 1.5
     )
+
 
     stop_candidate = round(
         min(
@@ -426,25 +541,49 @@ def check_stock(row):
     )
 
 
-    # =====================================================
-    # 保存済み逆指値
-    # 一度上がったら下げない
-    # =====================================================
+    def clean(value):
 
-    try:
+        try:
 
-        saved_stop = float(
-            row.get(
-                "stop_price"
+            value = float(
+                value
             )
+
+
+            if pd.isna(
+                value
+            ):
+
+                return None
+
+
+            return value
+
+
+        except Exception:
+
+            return None
+
+
+    saved_stop = clean(
+        row.get(
+            "stop_price"
         )
+    )
 
-        if pd.isna(saved_stop):
-            saved_stop = None
 
-    except Exception:
+    initial_stop = clean(
+        row.get(
+            "initial_stop_price"
+        )
+    )
 
-        saved_stop = None
+
+    if initial_stop is None:
+
+        initial_stop = float(
+            stop_candidate
+        )
 
 
     if saved_stop is None:
@@ -452,6 +591,7 @@ def check_stock(row):
         active_stop = float(
             stop_candidate
         )
+
 
     else:
 
@@ -463,23 +603,45 @@ def check_stock(row):
         )
 
 
+    portfolio_update = {}
+
+
+    if clean(
+        row.get(
+            "initial_stop_price"
+        )
+    ) is None:
+
+        portfolio_update[
+            "initial_stop_price"
+        ] = initial_stop
+
+
     if (
         saved_stop is None
         or active_stop > saved_stop
     ):
 
+        portfolio_update[
+            "stop_price"
+        ] = active_stop
+
+
+    if portfolio_update:
+
         (
             supabase
-            .table("portfolio")
+            .table(
+                "portfolio"
+            )
             .update(
-                {
-                    "stop_price":
-                        active_stop
-                }
+                portfolio_update
             )
             .eq(
                 "id",
-                row["id"]
+                row[
+                    "id"
+                ]
             )
             .execute()
         )
@@ -489,6 +651,24 @@ def check_stock(row):
         price
         - active_stop
     ) / price * 100
+
+
+    buy_price = float(
+        row[
+            "buy_price"
+        ]
+    )
+
+
+    (
+        risk,
+        tp1,
+        tp2
+    ) = get_take_profit_lines(
+        buy_price,
+        initial_stop,
+        atr14
+    )
 
 
     # =====================================================
@@ -535,27 +715,46 @@ def check_stock(row):
     if score >= 4:
 
         risk_rank = 4
-        status = "🟢 強い上昇"
+
+        status = (
+            "🟢 強い上昇"
+        )
+
 
     elif score >= 2:
 
         risk_rank = 3
-        status = "🟢 上昇"
+
+        status = (
+            "🟢 上昇"
+        )
+
 
     elif score >= 0:
 
         risk_rank = 2
-        status = "🟡 様子見"
+
+        status = (
+            "🟡 様子見"
+        )
+
 
     elif score >= -2:
 
         risk_rank = 1
-        status = "🟠 注意"
+
+        status = (
+            "🟠 注意"
+        )
+
 
     else:
 
         risk_rank = 0
-        status = "🔴 危険"
+
+        status = (
+            "🔴 危険"
+        )
 
 
     sudden_drop = (
@@ -563,23 +762,29 @@ def check_stock(row):
     )
 
 
-    # 到達済みも含む
     stop_near = (
         stop_distance <= 2
     )
 
 
+    stop_breached = (
+        price <= active_stop
+    )
+
+
     breakdown = (
-        price
-        < prior_20_low
+        price < prior_20_low
     )
 
 
     return {
-        "ticker": code,
+        "ticker":
+            code,
 
         "name":
-            company_name(code),
+            company_name(
+                code
+            ),
 
         "price":
             price,
@@ -605,24 +810,38 @@ def check_stock(row):
         "stop_distance":
             stop_distance,
 
-        "sudden_drop":
-            sudden_drop,
-
         "stop_near":
             stop_near,
 
+        "stop_breached":
+            stop_breached,
+
+        "sudden_drop":
+            sudden_drop,
+
         "breakdown":
-            breakdown
+            breakdown,
+
+        "risk":
+            risk,
+
+        "tp1":
+            tp1,
+
+        "tp2":
+            tp2
     }
 
 
 # =========================================================
-# 保有株取得
+# データ取得
 # =========================================================
 
 portfolio_result = (
     supabase
-    .table("portfolio")
+    .table(
+        "portfolio"
+    )
     .select("*")
     .execute()
 )
@@ -634,13 +853,11 @@ holdings = (
 )
 
 
-# =========================================================
-# 前回状態
-# =========================================================
-
 state_result = (
     supabase
-    .table("alert_state")
+    .table(
+        "alert_state"
+    )
     .select("*")
     .execute()
 )
@@ -648,7 +865,9 @@ state_result = (
 
 states = {
     str(
-        s["ticker"]
+        s[
+            "ticker"
+        ]
     ):
     s
 
@@ -659,12 +878,12 @@ states = {
 }
 
 
-# =========================================================
-# チェック
-# =========================================================
-
 alerts = []
 
+
+# =========================================================
+# 全銘柄チェック
+# =========================================================
 
 for row in holdings:
 
@@ -685,6 +904,7 @@ for row in holdings:
         current = check_stock(
             row
         )
+
 
     except Exception as e:
 
@@ -707,9 +927,9 @@ for row in holdings:
     reasons = []
 
 
-    # =====================================================
+    # -----------------------------------------------------
     # 判定悪化
-    # =====================================================
+    # -----------------------------------------------------
 
     if previous is not None:
 
@@ -734,9 +954,9 @@ for row in holdings:
             )
 
 
-    # =====================================================
+    # -----------------------------------------------------
     # 急落
-    # =====================================================
+    # -----------------------------------------------------
 
     previous_drop = (
         bool(
@@ -745,66 +965,92 @@ for row in holdings:
                 False
             )
         )
+
         if previous
+
         else False
     )
 
 
     if (
-        current["sudden_drop"]
+        current[
+            "sudden_drop"
+        ]
         and
         not previous_drop
     ):
 
         reasons.append(
-            "前日比 "
+            f"前日比 "
             f"{current['change_pct']:.2f}%"
         )
 
 
-    # =====================================================
-    # 逆指値接近・到達
-    # =====================================================
+    # -----------------------------------------------------
+    # 逆指値接近
+    # -----------------------------------------------------
 
-    previous_stop = (
+    previous_stop_near = (
         bool(
             previous.get(
                 "stop_near",
                 False
             )
         )
+
         if previous
+
         else False
     )
 
 
     if (
-        current["stop_near"]
+        current[
+            "stop_near"
+        ]
         and
-        not previous_stop
+        not previous_stop_near
     ):
 
-        if (
-            current[
-                "stop_distance"
-            ] <= 0
-        ):
+        reasons.append(
+            "逆指値まで2%以内"
+        )
 
-            reasons.append(
-                "逆指値ラインに到達・割れ"
+
+    # -----------------------------------------------------
+    # 逆指値到達
+    # -----------------------------------------------------
+
+    previous_breached = (
+        bool(
+            previous.get(
+                "stop_breached",
+                False
             )
+        )
 
-        else:
+        if previous
 
-            reasons.append(
-                "逆指値まで "
-                f"{current['stop_distance']:.2f}%"
-            )
+        else False
+    )
 
 
-    # =====================================================
+    if (
+        current[
+            "stop_breached"
+        ]
+        and
+        not previous_breached
+    ):
+
+        reasons.append(
+            "🚨 逆指値ライン到達・割れ"
+        )
+
+
+    # -----------------------------------------------------
     # 20日安値割れ
-    # =====================================================
+    # -----------------------------------------------------
 
     previous_breakdown = (
         bool(
@@ -813,13 +1059,17 @@ for row in holdings:
                 False
             )
         )
+
         if previous
+
         else False
     )
 
 
     if (
-        current["breakdown"]
+        current[
+            "breakdown"
+        ]
         and
         not previous_breakdown
     ):
@@ -829,11 +1079,107 @@ for row in holdings:
         )
 
 
+    # =====================================================
+    # 利確通知
+    # =====================================================
+
+    tp1_done = bool(
+        row.get(
+            "tp1_done",
+            False
+        )
+    )
+
+
+    tp2_done = bool(
+        row.get(
+            "tp2_done",
+            False
+        )
+    )
+
+
+    target_update = {}
+
+
+    # 利確②まで一気に上がった場合
+    # ②だけ通知して①も通知済みにする
+
+    if (
+        current[
+            "price"
+        ]
+        >= current[
+            "tp2"
+        ]
+        and
+        not tp2_done
+    ):
+
+        reasons.append(
+            "🎯 利確②到達 "
+            f"{current['tp2']:,.0f}円"
+        )
+
+
+        target_update[
+            "tp2_done"
+        ] = True
+
+
+        target_update[
+            "tp1_done"
+        ] = True
+
+
+    elif (
+        current[
+            "price"
+        ]
+        >= current[
+            "tp1"
+        ]
+        and
+        not tp1_done
+    ):
+
+        reasons.append(
+            "🎯 利確①到達 "
+            f"{current['tp1']:,.0f}円"
+        )
+
+
+        target_update[
+            "tp1_done"
+        ] = True
+
+
+    if target_update:
+
+        (
+            supabase
+            .table(
+                "portfolio"
+            )
+            .update(
+                target_update
+            )
+            .eq(
+                "id",
+                row[
+                    "id"
+                ]
+            )
+            .execute()
+        )
+
+
     if reasons:
 
         current[
             "alert_reasons"
         ] = reasons
+
 
         alerts.append(
             current
@@ -841,7 +1187,7 @@ for row in holdings:
 
 
     # =====================================================
-    # 状態保存
+    # 前回状態保存
     # =====================================================
 
     state_data = {
@@ -868,6 +1214,11 @@ for row in holdings:
                 "stop_near"
             ],
 
+        "stop_breached":
+            current[
+                "stop_breached"
+            ],
+
         "breakdown":
             current[
                 "breakdown"
@@ -887,9 +1238,12 @@ for row in holdings:
 
     (
         supabase
-        .table("alert_state")
+        .table(
+            "alert_state"
+        )
         .upsert(
             state_data,
+
             on_conflict="ticker"
         )
         .execute()
@@ -934,8 +1288,16 @@ if alerts:
 
 
         lines.append(
-            "逆指値 "
+            f"逆指値 "
             f"{stock['stop_price']:,.0f}円"
+        )
+
+
+        lines.append(
+            f"利確① "
+            f"{stock['tp1']:,.0f}円 / "
+            f"利確② "
+            f"{stock['tp2']:,.0f}円"
         )
 
 
@@ -956,13 +1318,13 @@ if alerts:
 
         headers={
             "Title":
-                "株AI 警告",
+                "株AI 通知",
 
             "Priority":
                 "high",
 
             "Tags":
-                "warning,chart_with_downwards_trend"
+                "warning,chart_with_upwards_trend"
         },
 
         timeout=30
@@ -970,6 +1332,7 @@ if alerts:
 
 
     response.raise_for_status()
+
 
     print(
         "notification sent"
