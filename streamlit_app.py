@@ -849,18 +849,65 @@ def get_stop_data(
     saved_final_exit,
     warning_candidate,
     atr14,
+    buy_price,
+    current_price,
+    confirmed_breakout_level=None,
 ):
     warning_candidate = round(float(warning_candidate))
+    original_warning_candidate = float(warning_candidate)
     saved_warning = clean_float(saved_stop)
     initial = clean_float(saved_initial_stop)
     saved_final = clean_float(saved_final_exit)
+    buy_price = float(buy_price)
+    current_price = float(current_price)
+    breakout_level = clean_float(confirmed_breakout_level)
+
+    # =====================================================
+    # 利益保護モード V10
+    #
+    # 買値より2%以上上の心理的節目を「正式突破」したら、
+    # それまでの広い警戒ラインだけに頼らず利益を守る段階へ移行する。
+    #
+    # 警戒ライン候補：
+    #   突破した節目 - max(0.75ATR, 節目の1%)
+    # ただし買値より下には置かない。
+    #
+    # 例）買値3,005円、3,100円正式突破なら、
+    # 3,100円の少し下（ATR分の押しを許容）まで警戒ラインを引き上げる。
+    # =====================================================
+    profit_protection_active = bool(
+        breakout_level is not None
+        and buy_price > 0
+        and breakout_level >= buy_price * 1.02
+    )
+    profit_warning_candidate = None
+    profit_buffer = None
+
+    if profit_protection_active:
+        profit_buffer = max(
+            float(atr14) * 0.75,
+            float(breakout_level) * 0.010,
+        )
+        raw_profit_warning = max(
+            buy_price,
+            float(breakout_level) - profit_buffer,
+        )
+        # 現在値より上に新しいラインを作らない。
+        profit_warning_candidate = min(
+            raw_profit_warning,
+            current_price * 0.995,
+        )
+        warning_candidate = max(
+            warning_candidate,
+            round(profit_warning_candidate),
+        )
 
     # 利確計算用の初期ラインは従来通り固定。
     if initial is None:
         initial = (
             float(saved_warning)
             if saved_warning is not None
-            else float(warning_candidate)
+            else float(original_warning_candidate)
         )
 
     # 警戒ラインは上方向にだけ追従。
@@ -876,9 +923,15 @@ def get_stop_data(
         float(atr14) * 0.50,
         active_warning * 0.015,
     )
-    final_candidate = round(
-        active_warning - final_gap
-    )
+    final_candidate = round(active_warning - final_gap)
+
+    # 利益保護モードでは、勝ちトレードが大きな損失に戻りにくいよう、
+    # 最終撤退ラインにも買値付近（買値-0.5%）の床を入れる。
+    if profit_protection_active and buy_price > 0:
+        final_candidate = max(
+            final_candidate,
+            round(buy_price * 0.995),
+        )
 
     # 必ず警戒ラインより下に置く。
     final_candidate = min(
@@ -922,7 +975,14 @@ def get_stop_data(
         except Exception:
             pass
 
-    return active_warning, initial, active_final
+    profit_info = {
+        "active": profit_protection_active,
+        "breakout_level": breakout_level,
+        "warning_candidate": profit_warning_candidate,
+        "buffer": profit_buffer,
+    }
+
+    return active_warning, initial, active_final, profit_info
 
 
 # =========================================================
@@ -2277,13 +2337,35 @@ with st.spinner("保有株を分析しています..."):
             profit = value - cost
             profit_pct = profit / cost * 100 if cost > 0 else 0
 
-            active_stop, initial_stop, final_exit = get_stop_data(
+            recent_confirmed_level = clean_float(
+                analysis["round_state"].get("recent_confirmed_level")
+            )
+            confirmed_breakout_level = saved_breakout_level
+            if recent_confirmed_level is not None:
+                confirmed_breakout_level = (
+                    recent_confirmed_level
+                    if confirmed_breakout_level is None
+                    else max(confirmed_breakout_level, recent_confirmed_level)
+                )
+
+            # 新規登録直後は、登録前に記録されていた古い突破履歴で
+            # いきなり利益保護モードをONにしない。
+            if (
+                clean_float(row.get("initial_stop_price")) is None
+                and clean_float(row.get("stop_price")) is None
+            ):
+                confirmed_breakout_level = recent_confirmed_level
+
+            active_stop, initial_stop, final_exit, profit_protection = get_stop_data(
                 row["id"],
                 row.get("stop_price"),
                 row.get("initial_stop_price"),
                 row.get("final_exit_price"),
                 analysis["stop_candidate"],
                 analysis["atr14"],
+                buy_price,
+                current_price,
+                confirmed_breakout_level=confirmed_breakout_level,
             )
 
             stop_gap_yen = current_price - active_stop
@@ -2354,6 +2436,7 @@ with st.spinner("保有株を分析しています..."):
                     "warning_breached": warning_breached,
                     "warning_close_breached": warning_close_breached,
                     "final_exit_breached": final_exit_breached,
+                    "profit_protection": profit_protection,
                     "risk_per_share": risk_per_share,
                     "tp1": tp1,
                     "tp2": tp2,
@@ -2599,6 +2682,30 @@ else:
             st.caption(item["judgment_reason"])
 
             # -----------------------------------------------------
+            # 利益保護モード
+            # -----------------------------------------------------
+            protection = item.get("profit_protection") or {}
+            if protection.get("active"):
+                breakout_level = protection.get("breakout_level")
+                next_target = None
+                if breakout_level is not None:
+                    next_target = breakout_level + a["round_state"]["step"]
+
+                message = (
+                    "💰 **利益保護モード ON**\n\n"
+                    f"**{breakout_level:,.0f}円** の正式突破を確認したため、"
+                    "利益を守る段階に切り替えています。"
+                )
+                if next_target is not None:
+                    message += f"\n\n次の心理的目標： **{next_target:,.0f}円前後**"
+                st.success(message)
+                st.caption(
+                    "買値より2%以上上の心理的節目を正式突破すると自動でON。"
+                    "突破した節目の少し下まで警戒ラインを引き上げ、"
+                    "最終撤退ラインも買値付近より大きく下がりにくくします。"
+                )
+
+            # -----------------------------------------------------
             # 2段階防御ライン
             # -----------------------------------------------------
             st.markdown("### 🛡️ 2段階防御ライン")
@@ -2647,10 +2754,17 @@ else:
                 f"現在値まで： **{final_gap_yen:,.0f}円 （{final_gap_pct:.2f}%）**"
             )
 
-            st.caption(
-                f"警戒ラインは現在の下落継続リスクに合わせて計算 "
-                f"（ATR × {a['stop_atr_multiplier']:.2f}）。"
-            )
+            if protection.get("active"):
+                st.caption(
+                    "警戒ラインは通常の下落継続リスク計算に加え、"
+                    "正式突破した節目から0.75ATR以上（最低1%）下の利益保護候補も比較し、"
+                    "高い方を採用します。"
+                )
+            else:
+                st.caption(
+                    f"警戒ラインは現在の下落継続リスクに合わせて計算 "
+                    f"（ATR × {a['stop_atr_multiplier']:.2f}）。"
+                )
             st.caption(
                 "最終撤退ラインは、警戒ラインからさらに0.5ATR以上"
                 "（最低1.5%）下に置きます。"

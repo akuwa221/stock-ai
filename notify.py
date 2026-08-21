@@ -493,9 +493,54 @@ def check_stock(row, previous_state=None):
     saved_stop = clean_float(row.get("stop_price"))
     initial_stop = clean_float(row.get("initial_stop_price"))
     saved_final_exit = clean_float(row.get("final_exit_price"))
+    buy_price = float(row["buy_price"])
+    original_stop_candidate = float(stop_candidate)
+
+    # =====================================================
+    # 利益保護モード V5
+    # 買値より2%以上上の心理的節目を正式突破したら、
+    # 突破した節目の少し下まで警戒ラインを自動で引き上げる。
+    # =====================================================
+    recent_confirmed = clean_float(round_state.get("recent_confirmed_level"))
+    confirmed_breakout_level = saved_breakout_level
+    if recent_confirmed is not None:
+        confirmed_breakout_level = (
+            recent_confirmed
+            if confirmed_breakout_level is None
+            else max(confirmed_breakout_level, recent_confirmed)
+        )
+
+    # 新規登録直後は、登録前の古い突破履歴では利益保護を開始しない。
+    if initial_stop is None and saved_stop is None:
+        confirmed_breakout_level = recent_confirmed
+
+    profit_protection_active = bool(
+        confirmed_breakout_level is not None
+        and buy_price > 0
+        and confirmed_breakout_level >= buy_price * 1.02
+    )
+    profit_warning_candidate = None
+
+    if profit_protection_active:
+        profit_buffer = max(
+            atr14 * 0.75,
+            confirmed_breakout_level * 0.010,
+        )
+        profit_warning_candidate = max(
+            buy_price,
+            confirmed_breakout_level - profit_buffer,
+        )
+        profit_warning_candidate = min(
+            profit_warning_candidate,
+            price * 0.995,
+        )
+        stop_candidate = max(
+            stop_candidate,
+            float(round(profit_warning_candidate)),
+        )
 
     if initial_stop is None:
-        initial_stop = float(saved_stop) if saved_stop is not None else float(stop_candidate)
+        initial_stop = float(saved_stop) if saved_stop is not None else float(original_stop_candidate)
 
     # stop_price は警戒ラインとして使う。
     active_stop = float(stop_candidate) if saved_stop is None else max(saved_stop, float(stop_candidate))
@@ -506,6 +551,14 @@ def check_stock(row, previous_state=None):
         active_stop * 0.015,
     )
     final_exit_candidate = round(active_stop - final_gap)
+
+    # 利益保護モードでは、最終撤退ラインにも買値付近の床を入れる。
+    if profit_protection_active and buy_price > 0:
+        final_exit_candidate = max(
+            final_exit_candidate,
+            round(buy_price * 0.995),
+        )
+
     final_exit_candidate = min(
         final_exit_candidate,
         round(active_stop * 0.985),
@@ -535,7 +588,6 @@ def check_stock(row, previous_state=None):
     stop_distance = (price - active_stop) / price * 100
     final_exit_distance = (price - active_final_exit) / price * 100
 
-    buy_price = float(row["buy_price"])
     risk, tp1, tp2 = get_take_profit_lines(buy_price, initial_stop, atr14)
 
     sudden_drop = change_pct <= -3
@@ -582,6 +634,9 @@ def check_stock(row, previous_state=None):
         "tp1": tp1,
         "tp2": tp2,
         "confirmed_level": confirmed_level,
+        "profit_protection_active": profit_protection_active,
+        "profit_breakout_level": confirmed_breakout_level,
+        "profit_warning_candidate": profit_warning_candidate,
         "resistance_level": resistance_level,
         "resistance_count": resistance_count,
     }
@@ -690,6 +745,13 @@ for row in holdings:
     if confirmed_level is not None:
         if previous_breakout_level is None or confirmed_level > previous_breakout_level:
             reasons.append(f"✅ {confirmed_level:,.0f}円を下側から正式突破")
+            if current.get("profit_protection_active"):
+                next_target = confirmed_level + get_price_step(current["price"])
+                reasons.append(
+                    "💰 利益保護モードON "
+                    f"→ 警戒ライン {current['stop_price']:,.0f}円 / "
+                    f"次の目標 {next_target:,.0f}円前後"
+                )
 
     # 強い抵抗線
     previous_resistance_level = clean_float(previous.get("resistance_level")) if previous else None
