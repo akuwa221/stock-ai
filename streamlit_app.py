@@ -925,19 +925,25 @@ def get_stop_data(
     )
     final_candidate = round(active_warning - final_gap)
 
-    # 利益保護モードでは、勝ちトレードが大きな損失に戻りにくいよう、
-    # 最終撤退ラインにも買値付近（買値-0.5%）の床を入れる。
+    # 利益保護モードでは、最終撤退ラインで損失に戻さない。
+    # 警戒ラインから通常は0.5ATR/1.5%の余裕を残すが、
+    # その計算値が買値を下回る場合は「買値」を下限にする。
     if profit_protection_active and buy_price > 0:
         final_candidate = max(
             final_candidate,
-            round(buy_price * 0.995),
+            round(buy_price),
         )
-
-    # 必ず警戒ラインより下に置く。
-    final_candidate = min(
-        final_candidate,
-        round(active_warning * 0.985),
-    )
+        # 最終撤退ラインは警戒ラインそのものには重ねない。
+        final_candidate = min(
+            final_candidate,
+            round(active_warning - 1),
+        )
+    else:
+        # 通常モードでは従来どおり、警戒ラインより最低1.5%下に置く。
+        final_candidate = min(
+            final_candidate,
+            round(active_warning * 0.985),
+        )
 
     # 最終撤退ラインも一度上げたら自動では下げない。
     active_final = (
@@ -2702,7 +2708,7 @@ else:
                 st.caption(
                     "買値より2%以上上の心理的節目を正式突破すると自動でON。"
                     "突破した節目の少し下まで警戒ラインを引き上げ、"
-                    "最終撤退ラインも買値付近より大きく下がりにくくします。"
+                    "最終撤退ラインは買値を下回らないようにします。"
                 )
 
             # -----------------------------------------------------

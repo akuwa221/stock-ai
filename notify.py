@@ -552,17 +552,22 @@ def check_stock(row, previous_state=None):
     )
     final_exit_candidate = round(active_stop - final_gap)
 
-    # 利益保護モードでは、最終撤退ラインにも買値付近の床を入れる。
+    # 利益保護モードでは、最終撤退ラインで損失に戻さない。
+    # 通常の余裕幅より買値が上なら、買値を最終撤退ラインの下限にする。
     if profit_protection_active and buy_price > 0:
         final_exit_candidate = max(
             final_exit_candidate,
-            round(buy_price * 0.995),
+            round(buy_price),
         )
-
-    final_exit_candidate = min(
-        final_exit_candidate,
-        round(active_stop * 0.985),
-    )
+        final_exit_candidate = min(
+            final_exit_candidate,
+            round(active_stop - 1),
+        )
+    else:
+        final_exit_candidate = min(
+            final_exit_candidate,
+            round(active_stop * 0.985),
+        )
 
     active_final_exit = (
         float(final_exit_candidate)
