@@ -356,6 +356,96 @@ def build_ticker_trade_summary(trades):
     return grouped.sort_values("実現損益", ascending=False)
 
 
+def render_historical_trade_registration():
+    """v12導入前など、すでに売却済みの取引を履歴だけ追加する。保有株は変更しない。"""
+    st.markdown("#### 過去の売却を追加")
+    st.caption(
+        "v12導入前など、すでに売却が済んでいる取引を成績へ反映するための入力です。"
+        "ここで登録しても現在の保有株数は変わりません。"
+    )
+
+    h1, h2 = st.columns(2)
+    with h1:
+        sold_date = st.date_input(
+            "売却日",
+            value=datetime.now(JST).date(),
+            key="history_sold_date",
+        )
+        hist_ticker = st.text_input(
+            "銘柄コード",
+            placeholder="例：8001",
+            key="history_ticker",
+        )
+        hist_buy_price = st.number_input(
+            "買値",
+            min_value=0.0,
+            step=1.0,
+            value=0.0,
+            key="history_buy_price",
+        )
+    with h2:
+        hist_sell_price = st.number_input(
+            "売値",
+            min_value=0.0,
+            step=1.0,
+            value=0.0,
+            key="history_sell_price",
+        )
+        hist_shares = st.number_input(
+            "売却株数",
+            min_value=1,
+            step=1,
+            value=100,
+            key="history_sold_shares",
+        )
+
+    estimated_profit = (float(hist_sell_price) - float(hist_buy_price)) * int(hist_shares)
+    if hist_buy_price > 0 and hist_sell_price > 0:
+        if estimated_profit >= 0:
+            st.success(f"この取引の実現損益：**+{estimated_profit:,.0f}円**")
+        else:
+            st.error(f"この取引の実現損益：**{estimated_profit:,.0f}円**")
+
+    if st.button("過去の売却を登録", key="register_historical_trade"):
+        code = hist_ticker.strip()
+        if not code:
+            st.warning("銘柄コードを入力してください。")
+            return
+        if hist_buy_price <= 0 or hist_sell_price <= 0:
+            st.warning("買値と売値を入力してください。")
+            return
+
+        try:
+            normalized = normalize_ticker(code)
+            company_name = get_company_name(code)
+            sold_at = datetime.combine(sold_date, time(15, 0), tzinfo=JST)
+            cost_basis = float(hist_buy_price) * int(hist_shares)
+            proceeds = float(hist_sell_price) * int(hist_shares)
+            realized_profit = proceeds - cost_basis
+
+            supabase.table("trade_history").insert(
+                {
+                    "sold_at": sold_at.isoformat(),
+                    "ticker": normalized,
+                    "company_name": str(company_name or simple_ticker(normalized)),
+                    "buy_price": float(hist_buy_price),
+                    "sell_price": float(hist_sell_price),
+                    "sold_shares": int(hist_shares),
+                    "cost_basis": cost_basis,
+                    "proceeds": proceeds,
+                    "realized_profit": realized_profit,
+                }
+            ).execute()
+            st.success(
+                f"{sold_date.strftime('%Y/%m/%d')} {simple_ticker(normalized)} の売却履歴を登録しました。"
+                f" 実現損益 {realized_profit:+,.0f}円"
+            )
+            st.cache_data.clear()
+            st.rerun()
+        except Exception as e:
+            st.error(f"過去の売却履歴の登録に失敗しました：{e}")
+
+
 def render_account_management(account_data, metrics):
     st.subheader("📒 運用成績")
 
@@ -447,6 +537,10 @@ def render_account_management(account_data, metrics):
             "追加資金は利益には含めません。現金余力と総資産には即反映し、"
             "月間3%目標の基準額には翌月から反映します。"
         )
+
+        st.divider()
+        render_historical_trade_registration()
+        st.caption("※同じ取引を2回登録すると利益も二重計上されるため、重複登録には注意してください。")
 
         with st.expander("初期運用元本を修正"):
             corrected_capital = st.number_input(
