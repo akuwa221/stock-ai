@@ -127,6 +127,453 @@ def clean_int(value, default=0):
         return default
 
 
+def to_jst_timestamp(value):
+    """Supabaseの日時をJSTのTimestampへ安全に変換する。"""
+    try:
+        ts = pd.to_datetime(value, utc=True, errors="coerce")
+        if pd.isna(ts):
+            return pd.NaT
+        return ts.tz_convert("Asia/Tokyo")
+    except Exception:
+        return pd.NaT
+
+
+def load_account_data():
+    """運用成績管理用テーブルを取得する。SQL未適用時はready=False。"""
+    try:
+        settings_rows = (
+            supabase.table("account_settings")
+            .select("*")
+            .eq("id", 1)
+            .execute()
+            .data
+            or []
+        )
+        cash_flows = (
+            supabase.table("cash_flows")
+            .select("*")
+            .order("occurred_at", desc=True)
+            .execute()
+            .data
+            or []
+        )
+        trade_rows = (
+            supabase.table("trade_history")
+            .select("*")
+            .order("sold_at", desc=True)
+            .execute()
+            .data
+            or []
+        )
+        return {
+            "ready": True,
+            "settings": settings_rows[0] if settings_rows else {},
+            "cash_flows": cash_flows,
+            "trades": trade_rows,
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "ready": False,
+            "settings": {},
+            "cash_flows": [],
+            "trades": [],
+            "error": str(e),
+        }
+
+
+def calculate_account_metrics(holdings, total_market_value, total_cost_known, account_data):
+    """
+    売買履歴・入金履歴・現在保有から運用成績を計算する。
+
+    現金余力 = 累計入金額 + 累計実現損益 - 現在保有の取得原価
+    月間3%目標の基準額 = 初期元本 + 月初より前の追加資金 + 月初より前の実現損益
+    （月途中の追加入金は翌月の目標から反映）
+    """
+    settings = account_data.get("settings") or {}
+    initial_capital = clean_float(settings.get("initial_capital")) or 0.0
+
+    cash_flows = account_data.get("cash_flows") or []
+    trades = account_data.get("trades") or []
+
+    deposits_total = 0.0
+    withdrawals_total = 0.0
+    for flow in cash_flows:
+        amount = clean_float(flow.get("amount")) or 0.0
+        flow_type = str(flow.get("flow_type", "deposit"))
+        if flow_type == "withdrawal":
+            withdrawals_total += amount
+        else:
+            deposits_total += amount
+
+    total_realized = sum((clean_float(t.get("realized_profit")) or 0.0) for t in trades)
+    current_cost_basis = sum(
+        (clean_float(row.get("buy_price")) or 0.0) * clean_int(row.get("shares"), 0)
+        for row in holdings
+    )
+
+    contributed_capital = initial_capital + deposits_total - withdrawals_total
+    cash_available = contributed_capital + total_realized - current_cost_basis
+    total_assets = cash_available + float(total_market_value or 0.0)
+    unrealized_profit = float(total_market_value or 0.0) - float(total_cost_known or 0.0)
+
+    now = datetime.now(JST)
+    month_start = pd.Timestamp(
+        datetime(now.year, now.month, 1, tzinfo=JST)
+    )
+
+    realized_before_month = 0.0
+    realized_this_month = 0.0
+    wins_this_month = 0
+    losses_this_month = 0
+    profit_values = []
+    loss_values = []
+
+    for trade in trades:
+        profit = clean_float(trade.get("realized_profit")) or 0.0
+        sold_at = to_jst_timestamp(trade.get("sold_at"))
+        if pd.isna(sold_at):
+            continue
+        if sold_at < month_start:
+            realized_before_month += profit
+        else:
+            realized_this_month += profit
+            if profit > 0:
+                wins_this_month += 1
+            elif profit < 0:
+                losses_this_month += 1
+
+        if profit > 0:
+            profit_values.append(profit)
+        elif profit < 0:
+            loss_values.append(profit)
+
+    deposits_before_month = 0.0
+    withdrawals_before_month = 0.0
+    for flow in cash_flows:
+        amount = clean_float(flow.get("amount")) or 0.0
+        occurred_at = to_jst_timestamp(flow.get("occurred_at"))
+        if pd.isna(occurred_at) or occurred_at >= month_start:
+            continue
+        if str(flow.get("flow_type", "deposit")) == "withdrawal":
+            withdrawals_before_month += amount
+        else:
+            deposits_before_month += amount
+
+    monthly_target_base = (
+        initial_capital
+        + deposits_before_month
+        - withdrawals_before_month
+        + realized_before_month
+    )
+    monthly_target_base = max(monthly_target_base, 0.0)
+    monthly_target = monthly_target_base * 0.03
+    monthly_target_progress = (
+        realized_this_month / monthly_target * 100
+        if monthly_target > 0
+        else 0.0
+    )
+    monthly_profit_rate = (
+        realized_this_month / monthly_target_base * 100
+        if monthly_target_base > 0
+        else 0.0
+    )
+    target_remaining = max(monthly_target - realized_this_month, 0.0)
+
+    total_closed = wins_this_month + losses_this_month
+    month_win_rate = wins_this_month / total_closed * 100 if total_closed else None
+
+    all_nonzero = [
+        clean_float(t.get("realized_profit")) or 0.0
+        for t in trades
+        if (clean_float(t.get("realized_profit")) or 0.0) != 0
+    ]
+    all_wins = [v for v in all_nonzero if v > 0]
+    all_losses = [v for v in all_nonzero if v < 0]
+    all_win_rate = len(all_wins) / len(all_nonzero) * 100 if all_nonzero else None
+
+    return {
+        "initial_capital": initial_capital,
+        "deposits_total": deposits_total,
+        "withdrawals_total": withdrawals_total,
+        "contributed_capital": contributed_capital,
+        "total_realized": total_realized,
+        "current_cost_basis": current_cost_basis,
+        "cash_available": cash_available,
+        "total_assets": total_assets,
+        "unrealized_profit": unrealized_profit,
+        "realized_this_month": realized_this_month,
+        "monthly_target_base": monthly_target_base,
+        "monthly_target": monthly_target,
+        "monthly_target_progress": monthly_target_progress,
+        "monthly_profit_rate": monthly_profit_rate,
+        "target_remaining": target_remaining,
+        "month_win_rate": month_win_rate,
+        "all_win_rate": all_win_rate,
+        "avg_profit": sum(all_wins) / len(all_wins) if all_wins else None,
+        "avg_loss": sum(all_losses) / len(all_losses) if all_losses else None,
+    }
+
+
+def build_monthly_trade_summary(trades):
+    rows = []
+    for trade in trades:
+        sold_at = to_jst_timestamp(trade.get("sold_at"))
+        if pd.isna(sold_at):
+            continue
+        rows.append(
+            {
+                "月": sold_at.strftime("%Y-%m"),
+                "実現損益": clean_float(trade.get("realized_profit")) or 0.0,
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    result = (
+        df.groupby("月", as_index=False)
+        .agg(売却回数=("実現損益", "size"), 実現損益=("実現損益", "sum"))
+        .sort_values("月", ascending=False)
+    )
+    return result
+
+
+def build_ticker_trade_summary(trades):
+    rows = []
+    for trade in trades:
+        profit = clean_float(trade.get("realized_profit")) or 0.0
+        code = simple_ticker(str(trade.get("ticker", "")))
+        name = str(trade.get("company_name") or "").strip()
+        label = f"{code} {name}".strip()
+        rows.append({"銘柄": label, "実現損益": profit})
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    grouped = df.groupby("銘柄", as_index=False).agg(
+        売却回数=("実現損益", "size"),
+        実現損益=("実現損益", "sum"),
+    )
+    return grouped.sort_values("実現損益", ascending=False)
+
+
+def render_account_management(account_data, metrics):
+    st.subheader("📒 運用成績")
+
+    if not account_data.get("ready"):
+        st.warning(
+            "運用成績管理用のSupabaseテーブルがまだありません。"
+            "先に付属の `supabase_v12.sql` をSQL Editorで1回実行してください。"
+        )
+        with st.expander("エラー詳細"):
+            st.code(account_data.get("error") or "不明なエラー")
+        return
+
+    initial_capital = metrics["initial_capital"]
+    if initial_capital <= 0:
+        st.warning(
+            "最初に現在の運用元本を1回だけ登録してください。"
+            "今持っている株の取得額だけでなく、証券口座の現金余力も含めた運用資金総額です。"
+        )
+        setup_capital = st.number_input(
+            "現在の運用元本",
+            min_value=0.0,
+            step=10000.0,
+            value=0.0,
+            key="setup_initial_capital",
+        )
+        if st.button("運用元本を登録", type="primary", key="save_initial_capital"):
+            if setup_capital <= 0:
+                st.warning("運用元本を入力してください。")
+            else:
+                supabase.table("account_settings").upsert(
+                    {"id": 1, "initial_capital": float(setup_capital)}
+                ).execute()
+                st.cache_data.clear()
+                st.rerun()
+        return
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("現在の現金余力", f"{metrics['cash_available']:,.0f}円")
+    with c2:
+        st.metric("現在の総資産", f"{metrics['total_assets']:,.0f}円")
+
+    c3, c4 = st.columns(2)
+    with c3:
+        st.metric("今月の確定利益", f"{metrics['realized_this_month']:+,.0f}円")
+    with c4:
+        st.metric("現在の含み損益", f"{metrics['unrealized_profit']:+,.0f}円")
+
+    target = metrics["monthly_target"]
+    progress = metrics["monthly_target_progress"]
+    if target > 0:
+        st.write(
+            f"今月の3%目標： **{target:,.0f}円** "
+            f"（基準額 {metrics['monthly_target_base']:,.0f}円）"
+        )
+        st.progress(min(max(progress / 100, 0.0), 1.0))
+        if metrics["target_remaining"] > 0:
+            st.caption(
+                f"達成率 {progress:.1f}% / あと {metrics['target_remaining']:,.0f}円"
+            )
+        else:
+            st.success(f"🎉 月間3%目標を達成しています（達成率 {progress:.1f}%）")
+        st.caption(
+            f"今月の確定利益率：{metrics['monthly_profit_rate']:+.2f}%"
+            "　※月途中の追加入金は翌月の3%目標から反映"
+        )
+
+    with st.expander("💰 資金追加・成績詳細"):
+        st.markdown("#### 資金を追加")
+        add_amount = st.number_input(
+            "追加する金額",
+            min_value=0.0,
+            step=10000.0,
+            value=0.0,
+            key="capital_add_amount",
+        )
+        if st.button("資金を追加", type="primary", key="add_capital_button"):
+            if add_amount <= 0:
+                st.warning("追加する金額を入力してください。")
+            else:
+                supabase.table("cash_flows").insert(
+                    {"flow_type": "deposit", "amount": float(add_amount)}
+                ).execute()
+                st.success(f"{add_amount:,.0f}円を運用資金に追加しました。")
+                st.cache_data.clear()
+                st.rerun()
+
+        st.caption(
+            "追加資金は利益には含めません。現金余力と総資産には即反映し、"
+            "月間3%目標の基準額には翌月から反映します。"
+        )
+
+        with st.expander("初期運用元本を修正"):
+            corrected_capital = st.number_input(
+                "初期運用元本",
+                min_value=0.0,
+                step=10000.0,
+                value=float(initial_capital),
+                key="correct_initial_capital",
+            )
+            if st.button("元本設定を修正", key="correct_initial_capital_button"):
+                supabase.table("account_settings").upsert(
+                    {"id": 1, "initial_capital": float(corrected_capital)}
+                ).execute()
+                st.cache_data.clear()
+                st.rerun()
+
+        st.markdown("#### 集計")
+        s1, s2 = st.columns(2)
+        with s1:
+            win_rate = metrics["all_win_rate"]
+            st.metric("累計勝率", "-" if win_rate is None else f"{win_rate:.1f}%")
+            avg_profit = metrics["avg_profit"]
+            st.metric("平均利益", "-" if avg_profit is None else f"{avg_profit:+,.0f}円")
+        with s2:
+            st.metric("累計実現損益", f"{metrics['total_realized']:+,.0f}円")
+            avg_loss = metrics["avg_loss"]
+            st.metric("平均損失", "-" if avg_loss is None else f"{avg_loss:+,.0f}円")
+
+        trades = account_data.get("trades") or []
+        monthly = build_monthly_trade_summary(trades)
+        if not monthly.empty:
+            st.markdown("#### 月別利益")
+            monthly_display = monthly.copy()
+            monthly_display["実現損益"] = monthly_display["実現損益"].map(lambda v: f"{v:+,.0f}円")
+            st.dataframe(monthly_display, use_container_width=True, hide_index=True)
+
+        by_ticker = build_ticker_trade_summary(trades)
+        if not by_ticker.empty:
+            st.markdown("#### 銘柄ごとの利益")
+            ticker_display = by_ticker.copy()
+            ticker_display["実現損益"] = ticker_display["実現損益"].map(lambda v: f"{v:+,.0f}円")
+            st.dataframe(ticker_display, use_container_width=True, hide_index=True)
+
+        if trades:
+            st.markdown("#### 最近の売買履歴")
+            recent_rows = []
+            for trade in trades[:20]:
+                sold_at = to_jst_timestamp(trade.get("sold_at"))
+                recent_rows.append(
+                    {
+                        "売却日": "" if pd.isna(sold_at) else sold_at.strftime("%Y/%m/%d"),
+                        "銘柄": f"{simple_ticker(str(trade.get('ticker', '')))} {str(trade.get('company_name') or '').strip()}".strip(),
+                        "買値": clean_float(trade.get("buy_price")) or 0.0,
+                        "売値": clean_float(trade.get("sell_price")) or 0.0,
+                        "株数": clean_int(trade.get("sold_shares"), 0),
+                        "実現損益": clean_float(trade.get("realized_profit")) or 0.0,
+                    }
+                )
+            history_df = pd.DataFrame(recent_rows)
+            history_df["買値"] = history_df["買値"].map(lambda v: f"{v:,.0f}円")
+            history_df["売値"] = history_df["売値"].map(lambda v: f"{v:,.0f}円")
+            history_df["実現損益"] = history_df["実現損益"].map(lambda v: f"{v:+,.0f}円")
+            st.dataframe(history_df, use_container_width=True, hide_index=True)
+
+
+def render_sale_registration(row, row_id, code, name, buy_price, shares, current_price, account_ready):
+    """売値と株数だけで売却登録する。DB側RPCで履歴保存と保有株更新を同時実行。"""
+    with st.expander("💴 売却登録"):
+        if not account_ready:
+            st.warning(
+                "売却履歴を保存するため、先に `supabase_v12.sql` をSupabaseで実行してください。"
+            )
+            return
+
+        st.caption("基本操作は「売却価格＋売却株数 → 売却登録」だけです。")
+        sell_price = st.number_input(
+            "売却価格",
+            min_value=0.0,
+            value=float(round(current_price)),
+            step=1.0,
+            key=f"sell_price_{row_id}",
+        )
+        sell_shares = st.number_input(
+            "売却株数",
+            min_value=1,
+            max_value=max(int(shares), 1),
+            value=int(shares),
+            step=1,
+            key=f"sell_shares_{row_id}",
+        )
+        estimated_profit = (float(sell_price) - float(buy_price)) * int(sell_shares)
+        proceeds = float(sell_price) * int(sell_shares)
+        if estimated_profit >= 0:
+            st.success(
+                f"登録すると実現損益 **+{estimated_profit:,.0f}円** / 売却代金 **{proceeds:,.0f}円**"
+            )
+        else:
+            st.error(
+                f"登録すると実現損益 **{estimated_profit:,.0f}円** / 売却代金 **{proceeds:,.0f}円**"
+            )
+
+        if st.button("売却登録", type="primary", key=f"register_sale_{row_id}"):
+            if sell_price <= 0:
+                st.warning("売却価格を入力してください。")
+                return
+            try:
+                response = supabase.rpc(
+                    "register_sale",
+                    {
+                        "p_portfolio_id": int(row_id),
+                        "p_sell_price": float(sell_price),
+                        "p_sell_shares": int(sell_shares),
+                        "p_company_name": str(name or code),
+                    },
+                ).execute()
+                result_rows = response.data or []
+                result = result_rows[0] if result_rows else {}
+                actual_profit = clean_float(result.get("realized_profit"))
+                if actual_profit is None:
+                    actual_profit = estimated_profit
+                st.success(f"売却を登録しました。実現損益 {actual_profit:+,.0f}円")
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as e:
+                st.error(f"売却登録に失敗しました：{e}")
+
+
 # =========================================================
 # Yahoo株価取得
 # =========================================================
@@ -2280,7 +2727,7 @@ def render_edit_controls(row, row_id, key_prefix=""):
             st.cache_data.clear()
             st.rerun()
 
-        if st.button("🗑️ この銘柄を削除", key=f"{key_prefix}delete_{row_id}"):
+        if st.button("🗑️ 登録ミスとして削除（売却ではない）", key=f"{key_prefix}delete_{row_id}"):
             supabase.table("portfolio").delete().eq("id", row_id).execute()
             st.cache_data.clear()
             st.rerun()
@@ -2301,6 +2748,9 @@ try:
     alert_states = {str(row["ticker"]): row for row in state_rows}
 except Exception:
     alert_states = {}
+
+# 売買・資金・運用成績管理
+account_data = load_account_data()
 
 
 # =========================================================
@@ -2539,6 +2989,24 @@ if holdings and total_cost_known > 0:
     st.caption("下の選択欄から、確認したい銘柄を1つ選んで表示します。")
     st.divider()
 
+# =========================================================
+# 運用成績・資金管理
+# =========================================================
+
+account_metrics = None
+if account_data.get("ready"):
+    account_metrics = calculate_account_metrics(
+        holdings=holdings,
+        total_market_value=total_value_known,
+        total_cost_known=total_cost_known,
+        account_data=account_data,
+    )
+    render_account_management(account_data, account_metrics)
+    st.divider()
+else:
+    render_account_management(account_data, {})
+    st.divider()
+
 
 # =========================================================
 # 保有株表示 / 銘柄切り替え
@@ -2646,10 +3114,22 @@ else:
                         st.error(f"参考損益： {item['profit']:,.0f}円 （{item['profit_pct']:.2f}%）")
                     if item.get("last_updated"):
                         st.caption(f"前回データ：{item['last_updated']}")
+
+                    render_sale_registration(
+                        row=row,
+                        row_id=row_id,
+                        code=code,
+                        name=name,
+                        buy_price=item["buy_price"],
+                        shares=item["shares"],
+                        current_price=current_price,
+                        account_ready=bool(account_data.get("ready")),
+                    )
                 else:
                     st.error("⚠️ 現在この銘柄の株価を取得できません。\n\n登録情報は消えていません。")
                     st.write(f"買値： **{item['buy_price']:,.0f}円**")
                     st.write(f"株数： **{item['shares']:,}株**")
+                    st.caption("株価を取得できないため、売却登録フォームは表示していません。")
 
                 with st.expander("⚠️ 取得エラー詳細"):
                     st.code(item["error"])
@@ -2673,6 +3153,17 @@ else:
                 st.success(f"含み損益： +{item['profit']:,.0f}円 （+{item['profit_pct']:.2f}%）")
             else:
                 st.error(f"含み損益： {item['profit']:,.0f}円 （{item['profit_pct']:.2f}%）")
+
+            render_sale_registration(
+                row=row,
+                row_id=row_id,
+                code=code,
+                name=name,
+                buy_price=item["buy_price"],
+                shares=item["shares"],
+                current_price=a["price"],
+                account_ready=bool(account_data.get("ready")),
+            )
 
             # -----------------------------------------------------
             # 保有・売却判断
